@@ -19,7 +19,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
@@ -80,8 +80,10 @@ class Trainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # AMP scaler
-        self.scaler = GradScaler() if use_amp else None
+        # AMP scaler - only for CUDA (MPS/CPU don't support it well)
+        device_type = device.type
+        self.use_amp = use_amp and device_type == "cuda"
+        self.scaler = GradScaler(device_type) if self.use_amp else None
 
         # Tensorboard
         self.writer = None
@@ -97,7 +99,7 @@ class Trainer:
 
         print(f"Trainer initialized:")
         print(f"  Device: {device}")
-        print(f"  AMP: {use_amp}")
+        print(f"  AMP: {self.use_amp}")
         print(f"  Multi-task: {multi_task}")
 
     def train_epoch(self) -> Dict[str, float]:
@@ -131,19 +133,26 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
         for batch_idx, (images, labels) in enumerate(pbar):
-            # Move to device
-            images = images.to(self.device)
+            # Move to device - use non_blocking for GPU to overlap transfer
+            non_blocking = self.device.type in ["cuda", "mps"]
+            images = images.to(self.device, non_blocking=non_blocking)
+
+            # Convert to channels_last for better performance on GPU (CUDA only - MPS has issues)
+            if self.device.type == "cuda":
+                images = images.to(memory_format=torch.channels_last)
 
             if self.multi_task:
                 # Multi-task labels
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                labels = {
+                    k: v.to(self.device, non_blocking=non_blocking) for k, v in labels.items()
+                }
             else:
                 # Single task
-                labels = labels["label_61"].to(self.device)
+                labels = labels["label_61"].to(self.device, non_blocking=non_blocking)
 
             # Forward pass with AMP
             if self.use_amp:
-                with autocast():
+                with autocast(device_type=self.device.type):
                     if self.multi_task:
                         outputs = self.model(images)
                         loss = self.criterion(outputs, labels)
@@ -158,15 +167,20 @@ class Trainer:
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
 
-            # Backward pass
-            self.optimizer.zero_grad()
+            # Backward pass - zero_grad with set_to_none for better performance
+            self.optimizer.zero_grad(set_to_none=True)
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
+                # Gradient clipping for stability
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
             # Metrics
@@ -229,7 +243,7 @@ class Trainer:
 
         return metrics
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def validate(self) -> Dict[str, float]:
         """
         Validate the model.
@@ -253,13 +267,20 @@ class Trainer:
             }
 
         for images, labels in tqdm(self.val_loader, desc="Validating"):
-            # Move to device
-            images = images.to(self.device)
+            # Move to device - use non_blocking for GPU to overlap transfer
+            non_blocking = self.device.type in ["cuda", "mps"]
+            images = images.to(self.device, non_blocking=non_blocking)
+
+            # Convert to channels_last for better performance on GPU (CUDA only - MPS has issues)
+            if self.device.type == "cuda":
+                images = images.to(memory_format=torch.channels_last)
 
             if self.multi_task:
-                labels = {k: v.to(self.device) for k, v in labels.items()}
+                labels = {
+                    k: v.to(self.device, non_blocking=non_blocking) for k, v in labels.items()
+                }
             else:
-                labels = labels["label_61"].to(self.device)
+                labels = labels["label_61"].to(self.device, non_blocking=non_blocking)
 
             # Forward pass
             if self.multi_task:

@@ -37,7 +37,10 @@ def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"Random seed set to {seed}")
@@ -180,6 +183,12 @@ def parse_args():
         default=True,
         help="Use automatic mixed precision",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=True,
+        help="Use torch.compile for 20-50%% speedup",
+    )
 
     # Misc
     parser.add_argument(
@@ -231,12 +240,30 @@ def main():
     # Set seed
     set_seed(args.seed)
 
-    # Device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
-    if torch.cuda.is_available():
+    # Device - MPS > CUDA > CPU
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print(f"\nUsing device: {device} (Metal Performance Shaders)")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"\nUsing device: {device}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA Version: {torch.version.cuda}")
+    else:
+        device = torch.device("cpu")
+        print(f"\nUsing device: {device}")
+
+    # Optimize DataLoader settings per device
+    # pin_memory only works on CUDA
+    use_pin_memory = device.type == "cuda"
+    # Optimal workers: MPS needs fewer due to memory transfer overhead
+    if device.type == "mps":
+        optimal_workers = min(4, args.num_workers)
+    elif device.type == "cuda":
+        optimal_workers = args.num_workers
+    else:
+        optimal_workers = min(8, args.num_workers)
+    use_persistent = optimal_workers > 0
 
     print("\n" + "=" * 60)
     print("Agricultural Disease Recognition - Training")
@@ -271,13 +298,14 @@ def main():
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
-    # Create dataloaders
+    # Create dataloaders with device-optimized settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        num_workers=optimal_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent,
         collate_fn=collate_fn,
     )
 
@@ -285,10 +313,15 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        num_workers=optimal_workers,
+        pin_memory=use_pin_memory,
+        persistent_workers=use_persistent,
         collate_fn=collate_fn,
     )
+
+    print(f"DataLoader workers: {optimal_workers}")
+    print(f"Pin memory: {use_pin_memory}")
+    print(f"Persistent workers: {use_persistent}")
 
     print(f"Training batches: {len(train_loader)}")
     print(f"Validation batches: {len(val_loader)}")
@@ -303,6 +336,31 @@ def main():
         num_classes=61,
     )
     model = model.to(device)
+
+    # Optimize memory layout for better performance (CUDA only - MPS has issues)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+        print("Using channels_last memory format for better performance")
+
+    # torch.compile for 20-50% speedup (PyTorch 2.0+)
+    # MPS: disabled due to stride mismatch bugs in convolution_backward
+    if args.compile and device.type != "mps":
+        try:
+            print("\nCompiling model with torch.compile...")
+            if device.type == "cuda":
+                # CUDA: use max-autotune for best performance
+                model = torch.compile(model, mode="max-autotune")
+            else:
+                # CPU: use default mode
+                model = torch.compile(model)
+            print("✅ Model compiled successfully")
+        except Exception as e:
+            print(f"⚠️  torch.compile failed ({e}), continuing without compilation")
+    elif args.compile and device.type == "mps":
+        print("\n⚠️  torch.compile disabled on MPS (known bugs with convolution_backward)")
+        print("    See: https://github.com/pytorch/pytorch/issues")
+    else:
+        print("\ntorch.compile disabled (use --compile to enable)")
 
     # Create loss function
     print("\nCreating loss function...")

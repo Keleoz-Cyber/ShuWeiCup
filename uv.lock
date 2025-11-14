@@ -3393,8 +3393,8 @@ requires-dist = [
     { name = "seaborn", specifier = ">=0.13.0" },
     { name = "tensorboard", specifier = ">=2.15.0" },
     { name = "timm", specifier = ">=0.9.12" },
-    { name = "torch", specifier = ">=2.1.0" },
-    { name = "torchvision", specifier = ">=0.16.0" },
+    { name = "torch", specifier = ">=2.9.1" },
+    { name = "torchvision", specifier = ">=0.24.1" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
 provides-extras = ["dev"]
