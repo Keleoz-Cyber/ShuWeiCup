@@ -18,3 +18,5 @@ checkpoints
 demo_plots
 evaluation_samples
 *.pth
+sample_visualizations
+sample_visualizations*

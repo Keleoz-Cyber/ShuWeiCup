@@ -16,7 +16,6 @@ import random
 import sys
 import time
 from pathlib import Path
-
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -42,15 +41,7 @@ def load_model(
 
     print(f"Loading {model_type} model from {model_path}")
 
-    # Create model
-    if model_type == "baseline":
-        model = BaselineModel(backbone="resnet50", num_classes=61, pretrained=False)
-    elif model_type == "multitask":
-        model = MultiTaskModel(backbone="resnet50", pretrained=False)
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-    # Load weights
+    # Load weights first to infer architecture
     checkpoint = torch.load(model_path, map_location=device)
 
     # Handle different checkpoint formats
@@ -67,6 +58,41 @@ def load_model(
             new_state_dict[k[10:]] = v  # Remove _orig_mod. prefix
         else:
             new_state_dict[k] = v
+
+    # Create model with correct architecture
+    if model_type == "baseline":
+        model = BaselineModel(backbone="resnet50", num_classes=61, pretrained=False)
+    elif model_type == "multitask":
+        # Infer architecture from checkpoint
+        num_classes_61 = 61
+        num_crops = 10
+        num_diseases = 28
+        num_severity = 4
+
+        # Try to infer from state dict
+        for k, v in new_state_dict.items():
+            if k == "head_61class.1.weight":
+                num_classes_61 = v.shape[0]
+            elif k == "head_crop.1.weight":
+                num_crops = v.shape[0]
+            elif k == "head_disease.1.weight":
+                num_diseases = v.shape[0]
+            elif k == "head_severity.1.weight":
+                num_severity = v.shape[0]
+
+        print(
+            f"Inferred architecture: {num_classes_61} classes, {num_crops} crops, {num_diseases} diseases, {num_severity} severity levels"
+        )
+        model = MultiTaskModel(
+            backbone="resnet50",
+            pretrained=False,
+            num_classes_61=num_classes_61,
+            num_crops=num_crops,
+            num_diseases=num_diseases,
+            num_severity=num_severity,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
     model.load_state_dict(new_state_dict)
 
