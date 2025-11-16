@@ -13,19 +13,21 @@ Usage:
 """
 
 import argparse
-
-# ===============================
-# Helper Utilities (Sampler / EMA / Mixup-CutMix / Custom Loop)
-# ===============================
 import math
 import random
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 # Import our modules
 from dataset import AgriDiseaseDataset, collate_fn, get_train_transform, get_val_transform
@@ -64,8 +66,6 @@ def build_weighted_sampler(metadata_df, label_col: str = "label_61", power: floa
     Build a WeightedRandomSampler with inverse freq^power weights.
     power=0.5 => inverse sqrt frequency (stabilizes extreme long-tail).
     """
-    from collections import Counter
-
     counts = Counter(metadata_df[label_col].tolist())
     weights = [1.0 / (counts[label] ** power) for label in metadata_df[label_col]]
 
@@ -188,6 +188,7 @@ def custom_train_loop(
     """
     Minimal custom training loop supporting sampler, Mixup/CutMix, EMA.
     Prints epoch metrics similar to Trainer.
+    Now includes real-time monitoring with TensorBoard, CSV history, and PNG plots.
     """
     # Type assertions
     assert isinstance(model, nn.Module), "model must be nn.Module"
@@ -196,10 +197,30 @@ def custom_train_loop(
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
+    # Initialize monitoring components
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    # TensorBoard writer
+    tb_writer = SummaryWriter(str(save_path / "logs"))
+    print(
+        f"[TensorBoard] Logging to {save_path / 'logs'} (run: tensorboard --logdir {save_path / 'logs'})"
+    )
+
+    # History tracking
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "train_acc": [],
+        "val_loss": [],
+        "val_acc": [],
+        "tail_acc": [],
+        "macro_f1": [],
+        "lr": [],
+    }
+
     # Precompute tail class set (bottom 25% frequency) for focal application
     label_col_values = train_loader.dataset.metadata["label_61"].tolist()
-    from collections import Counter
-
     freq_counter = Counter(label_col_values)
     sorted_ids = sorted(freq_counter.keys(), key=lambda k: freq_counter[k])
     tail_cut = max(1, int(len(sorted_ids) * 0.25))
@@ -366,8 +387,9 @@ def custom_train_loop(
             scheduler.step()
         train_acc = 100.0 * correct / total
         train_loss = total_loss / total
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
-            f"Epoch {epoch}/{epochs} | Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | LR {optimizer.param_groups[0]['lr']:.6f}"
+            f"Epoch {epoch}/{epochs} | Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | LR {current_lr:.6f}"
         )
         # Validation (EMA shadow if enabled)
         if ema:
@@ -379,6 +401,26 @@ def custom_train_loop(
                     p.data.copy_(saved[n])
         else:
             val_acc, val_loss, tail_mean_acc, macro_f1 = run_val(epoch)
+
+        # Update history
+        history["epoch"].append(epoch)
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["tail_acc"].append(tail_mean_acc)
+        history["macro_f1"].append(macro_f1)
+        history["lr"].append(current_lr)
+
+        # TensorBoard logging
+        tb_writer.add_scalar("train/loss", train_loss, epoch)
+        tb_writer.add_scalar("train/acc", train_acc, epoch)
+        tb_writer.add_scalar("val/loss", val_loss, epoch)
+        tb_writer.add_scalar("val/acc", val_acc, epoch)
+        tb_writer.add_scalar("val/tail_acc", tail_mean_acc, epoch)
+        tb_writer.add_scalar("val/macro_f1", macro_f1, epoch)
+        tb_writer.add_scalar("lr/learning_rate", current_lr, epoch)
+
         if use_cosine_classifier and epoch == center_update_epoch and model_type == "baseline":
             if not hasattr(model, "cosine_head"):
                 with torch.no_grad():
@@ -401,6 +443,56 @@ def custom_train_loop(
                 print(f"[Phase] CenterLoss activated @ epoch {epoch} (weight={center_loss_weight})")
         if val_acc > best_acc:
             best_acc = val_acc
+
+            # Generate confusion matrix for best model
+            model.eval()
+            all_preds = []
+            all_trues = []
+            with torch.no_grad():
+                for images_cm, labels_cm in val_loader:
+                    images_cm = images_cm.to(device)
+                    if device.type == "cuda":
+                        images_cm = images_cm.to(memory_format=torch.channels_last)
+                    targets_cm = labels_cm["label_61"].to(device)
+                    outputs_cm = model(images_cm)
+                    logits_cm = (
+                        outputs_cm["label_61"] if isinstance(outputs_cm, dict) else outputs_cm
+                    )
+                    preds_cm = torch.argmax(logits_cm, dim=1)
+                    all_preds.append(preds_cm.cpu())
+                    all_trues.append(targets_cm.cpu())
+
+                preds_cat = torch.cat(all_preds)
+                trues_cat = torch.cat(all_trues)
+
+                # Build confusion matrix
+                num_classes_cm = 61
+                cm = torch.zeros(num_classes_cm, num_classes_cm, dtype=torch.int32)
+                for t, p in zip(trues_cat.tolist(), preds_cat.tolist()):
+                    cm[t, p] += 1
+
+                # Save confusion matrix CSV
+                try:
+                    import pandas as pd
+
+                    cm_df = pd.DataFrame(cm.numpy())
+                    cm_df.to_csv(save_path / "confusion_matrix_best.csv", index=False)
+                    print(f"  [CM] Saved confusion matrix CSV")
+                except Exception as e:
+                    print(f"  [Warn] Failed to save CM CSV: {e}")
+
+                # Save confusion matrix PNG
+                fig_cm, ax_cm = plt.subplots(figsize=(10, 8))
+                im = ax_cm.imshow(cm.numpy(), cmap="Blues", aspect="auto")
+                ax_cm.set_title("Confusion Matrix (Best Model)", fontsize=14, fontweight="bold")
+                ax_cm.set_xlabel("Predicted Label")
+                ax_cm.set_ylabel("True Label")
+                plt.colorbar(im, ax=ax_cm, fraction=0.046, pad=0.04)
+                plt.tight_layout()
+                fig_cm.savefig(save_path / "confusion_matrix_best.png", dpi=120)
+                plt.close(fig_cm)
+                print(f"  [CM] Saved confusion matrix PNG")
+
             torch.save(
                 {
                     "epoch": epoch,
@@ -419,7 +511,87 @@ def custom_train_loop(
             print(
                 f"  ✅ New best (custom loop) val acc: {best_acc:.2f}% | TailAcc {tail_mean_acc:.2f}% | MacroF1 {macro_f1:.3f}"
             )
+
+    # Close TensorBoard writer
+    tb_writer.close()
+
+    # Plot training curves
+    if history["epoch"]:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle("Task 1 Training Progress", fontsize=16, fontweight="bold")
+
+        # Loss curves
+        axes[0, 0].plot(
+            history["epoch"],
+            history["train_loss"],
+            label="Train Loss",
+            color="tab:blue",
+            linewidth=2,
+        )
+        axes[0, 0].plot(
+            history["epoch"], history["val_loss"], label="Val Loss", color="tab:red", linewidth=2
+        )
+        axes[0, 0].set_title("Loss Curves", fontsize=12, fontweight="bold")
+        axes[0, 0].set_xlabel("Epoch")
+        axes[0, 0].set_ylabel("Loss")
+        axes[0, 0].grid(alpha=0.3)
+        axes[0, 0].legend()
+
+        # Accuracy curves
+        axes[0, 1].plot(
+            history["epoch"], history["train_acc"], label="Train Acc", color="tab:blue", linewidth=2
+        )
+        axes[0, 1].plot(
+            history["epoch"], history["val_acc"], label="Val Acc", color="tab:red", linewidth=2
+        )
+        axes[0, 1].plot(
+            history["epoch"], history["tail_acc"], label="Tail Acc", color="tab:orange", linewidth=2
+        )
+        axes[0, 1].set_title("Accuracy Curves", fontsize=12, fontweight="bold")
+        axes[0, 1].set_xlabel("Epoch")
+        axes[0, 1].set_ylabel("Accuracy (%)")
+        axes[0, 1].grid(alpha=0.3)
+        axes[0, 1].legend()
+
+        # Macro F1 curve
+        axes[1, 0].plot(
+            history["epoch"], history["macro_f1"], label="Macro F1", color="tab:green", linewidth=2
+        )
+        axes[1, 0].set_title("Macro F1 Score", fontsize=12, fontweight="bold")
+        axes[1, 0].set_xlabel("Epoch")
+        axes[1, 0].set_ylabel("Macro F1")
+        axes[1, 0].grid(alpha=0.3)
+        axes[1, 0].legend()
+
+        # Learning rate curve
+        axes[1, 1].plot(
+            history["epoch"], history["lr"], label="Learning Rate", color="tab:purple", linewidth=2
+        )
+        axes[1, 1].set_title("Learning Rate Schedule", fontsize=12, fontweight="bold")
+        axes[1, 1].set_xlabel("Epoch")
+        axes[1, 1].set_ylabel("Learning Rate")
+        axes[1, 1].set_yscale("log")
+        axes[1, 1].grid(alpha=0.3)
+        axes[1, 1].legend()
+
+        plot_path = save_path / "training_curves.png"
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=120)
+        plt.close(fig)
+        print(f"\n[Plot] Saved training curves -> {plot_path}")
+
+        # Save CSV history
+        try:
+            import pandas as pd
+
+            hist_df = pd.DataFrame(history)
+            hist_df.to_csv(save_path / "training_history.csv", index=False)
+            print(f"[History] Saved training history CSV -> {save_path / 'training_history.csv'}")
+        except Exception as e:
+            print(f"[Warn] Failed to save training history CSV: {e}")
+
     print(f"\nCustom training finished. Best Val Acc: {best_acc:.2f}%")
+    print(f"Checkpoints and logs saved to: {save_path}")
 
 
 def set_seed(seed: int = 42):
