@@ -158,7 +158,7 @@ class ArcFaceHead(nn.Module):
             idx = torch.arange(logits.size(0), device=logits.device)
             target_theta = theta[idx, labels] + self.margin
             logits = logits.clone()
-            logits[idx, labels] = torch.cos(target_theta)
+            logits[idx, labels] = torch.cos(target_theta).to(logits.dtype)
         return self.scale * logits
 
 
