@@ -460,22 +460,28 @@ def calibrate_temperature(
     return T.detach().item()
 
 
-def build_class_weights(counts: Dict[int, int], method: str = "sqrt") -> torch.Tensor:
+def build_class_weights(
+    counts: Dict[int, int],
+    method: str = "sqrt",
+    num_classes: int = 4,
+) -> torch.Tensor:
     """
-    counts: dict severity_4class -> count
+    counts: dict severity label -> count
     method:
         - 'inv': inverse frequency
         - 'sqrt': 1 / sqrt(freq)
         - 'none': uniform
+    num_classes: number of classes to build weights for
     """
-    freq = np.array([counts.get(i, 1) for i in range(4)], dtype=np.float64)
+    freq = np.array([counts.get(i, 1) for i in range(num_classes)], dtype=np.float64)
     if method == "inv":
         w = 1.0 / freq
     elif method == "sqrt":
         w = 1.0 / np.sqrt(freq)
     else:
         w = np.ones_like(freq)
-    w = w / w.mean()
+    mean_w = w.mean()
+    w = w / mean_w if mean_w > 0 else w
     return torch.tensor(w, dtype=torch.float32)
 
 
@@ -797,9 +803,11 @@ def main():
 
     # Class weights
     if args.use_class_weights:
-        class_weights = build_class_weights(train_ds.class_counts, args.class_weight_method).to(
-            device
-        )
+        class_weights = build_class_weights(
+            train_ds.class_counts,
+            args.class_weight_method,
+            num_classes=(4 if args.mode == "four_class_hash" else 3),
+        ).to(device)
         print(f"\nUsing class weights ({args.class_weight_method}): {class_weights.cpu().numpy()}")
     else:
         class_weights = None
