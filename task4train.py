@@ -234,6 +234,21 @@ def topk_from_logits(logits: torch.Tensor, k: int = 3) -> List[Tuple[int, float]
     return [(int(preds[0, i].item()), float(confs[0, i].item())) for i in range(confs.size(1))]
 
 
+class SeverityCAMWrapper(nn.Module):
+    """Wrapper to extract severity logits for Grad-CAM compatibility."""
+
+    def __init__(self, multitask_model):
+        super().__init__()
+        self.model = multitask_model
+
+    def forward(self, x):
+        outputs = self.model(x)
+        return outputs["severity"]  # Return only severity tensor for CAM
+
+    def get_last_conv_layer(self):
+        return self.model.get_last_conv_layer()
+
+
 @torch.no_grad()
 def generate_diagnostic_report(
     model: nn.Module,
@@ -248,7 +263,7 @@ def generate_diagnostic_report(
     rows = []
     # Removed unused 'samples' variable
 
-    # Optional Grad-CAM
+    # Optional Grad-CAM - wrap model for severity-only output
     cam = None
     if (
         cam_dir is not None
@@ -258,9 +273,11 @@ def generate_diagnostic_report(
     ):
         cam_dir.mkdir(parents=True, exist_ok=True)
         try:
-            target_layer = model.get_last_conv_layer()
-            cam = GradCAM(model=model, target_layers=[target_layer])
-        except Exception:
+            cam_model = SeverityCAMWrapper(model)
+            target_layer = cam_model.get_last_conv_layer()
+            cam = GradCAM(model=cam_model, target_layers=[target_layer])
+        except Exception as e:
+            print(f"Warning: Failed to initialize Grad-CAM: {e}")
             cam = None
 
     saved_cam = 0
@@ -315,8 +332,14 @@ def generate_diagnostic_report(
                 std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                 img_np = (img * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
-                # Grad-CAM requires gradients; enable explicitly
-                grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+                # Grad-CAM (wrapper returns severity tensor, not dict)
+                try:
+                    with torch.enable_grad():
+                        grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+                except Exception as e:
+                    print(f"Warning: CAM failed for {metas[i]['image_name']}: {e}")
+                    grayscale_cam = np.zeros((img_np.shape[0], img_np.shape[1]))
+
                 if callable(show_cam_on_image):
                     overlay = show_cam_on_image(
                         img_np, grayscale_cam, use_rgb=True, image_weight=0.55
