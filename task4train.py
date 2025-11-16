@@ -55,11 +55,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.metrics import confusion_matrix, f1_score
 from torch.utils.data import DataLoader, Dataset
 
 # Project modules
-from dataset import get_train_transform, get_val_transform
+# Removed unused get_train_transform, get_val_transform imports
 from losses import MultiTaskLoss
 from models import MultiTaskModel
 from trainer import Trainer
@@ -215,15 +215,17 @@ class DiagnosticSample:
 
 
 def softmax_confidence(logits: torch.Tensor) -> Tuple[int, float]:
+    """Return (pred_class, confidence) with explicit casting."""
     probs = F.softmax(logits, dim=-1)
     conf, pred = torch.max(probs, dim=-1)
-    return pred.item(), conf.item()
+    return int(pred.item()), float(conf.item())
 
 
 def topk_from_logits(logits: torch.Tensor, k: int = 3) -> List[Tuple[int, float]]:
+    """Return top-k (class_id, confidence) tuples."""
     probs = F.softmax(logits, dim=-1)
-    confs, preds = torch.topk(probs, k=min(k, logits.size(-1)), dim=-1)
-    return [(preds[0, i].item(), confs[0, i].item()) for i in range(confs.size(1))]
+    confs, preds = torch.topk(probs, k=min(k, probs.size(-1)), dim=-1)
+    return [(int(preds[0, i].item()), float(confs[0, i].item())) for i in range(confs.size(1))]
 
 
 @torch.no_grad()
@@ -238,7 +240,7 @@ def generate_diagnostic_report(
 ):
     model.eval()
     rows = []
-    samples: List[DiagnosticSample] = []
+    # Removed unused 'samples' variable
 
     # Optional Grad-CAM
     cam = None
@@ -307,8 +309,8 @@ def generate_diagnostic_report(
                 std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
                 img_np = (img * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
-                with torch.enable_grad():
-                    grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+                # Grad-CAM requires gradients; enable explicitly
+                grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
                 if callable(show_cam_on_image):
                     overlay = show_cam_on_image(
                         img_np, grayscale_cam, use_rgb=True, image_weight=0.55
@@ -368,6 +370,13 @@ def evaluate_severity_metrics(model: nn.Module, loader: DataLoader, device: torc
         true = labels["severity"].cpu().tolist()
         all_t.extend(true)
         all_p.extend(pred)
+    if len(all_t) == 0:
+        # Guard empty loader case
+        return {
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "confusion_matrix": [[0, 0, 0, 0] for _ in range(4)],
+        }
     acc = (np.array(all_t) == np.array(all_p)).mean()
     macro = f1_score(all_t, all_p, average="macro")
     cm = confusion_matrix(all_t, all_p, labels=[0, 1, 2, 3]).tolist()
@@ -520,11 +529,9 @@ def main():
     ).to(device)
 
     # Class weights (optional)
-    class_weights_61 = None
-    class_weights_sev = None
-    if args.use_class - weights:
-        # Note: argparse doesn't support hyphen in variable names; use args.use_class_weights instead
-        pass  # placeholder to avoid syntax error (will replace below)
+    class_weights_61: Optional[torch.Tensor] = None
+    class_weights_sev: Optional[torch.Tensor] = None
+    # Removed stray placeholder referencing non-existent variable.
 
     if args.use_class_weights:
         import pandas as pd
