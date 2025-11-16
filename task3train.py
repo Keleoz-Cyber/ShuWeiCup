@@ -103,6 +103,51 @@ except ImportError:
     show_cam_on_image = None
 
 
+def estimate_cam_area(cam: np.ndarray, threshold: float = 0.35) -> float:
+    """
+    Estimate normalized CAM hot area ratio in [0,1].
+    Steps:
+      - Normalize CAM to [0,1]
+      - Threshold at 'threshold'
+      - Return fraction of pixels >= threshold
+    """
+    if cam is None:
+        return 0.0
+    cam = cam.astype(np.float32)
+    cmin, cmax = cam.min(), cam.max()
+    if cmax - cmin < 1e-6:
+        return 0.0
+    cam_norm = (cam - cmin) / (cmax - cmin + 1e-6)
+    return float((cam_norm >= threshold).mean())
+
+
+def posthoc_split_general_to_four(
+    pred3: np.ndarray, cams: List[np.ndarray], cam_threshold: float = 0.35
+) -> np.ndarray:
+    """
+    Convert 3-class predictions (0=Healthy,1=General,2=Serious) to 4-class:
+      0 -> 0 (Healthy)
+      2 -> 3 (Severe)
+      1 -> Mild(1) or Moderate(2) via CAM area threshold
+    Args:
+      pred3: np.ndarray of shape [N], values in {0,1,2}
+      cams: list of CAM arrays (H,W) aligned with pred3 (for general predictions)
+      cam_threshold: area threshold for Mild/Moderate split
+    Returns:
+      np.ndarray of shape [N], values in {0,1,2,3}
+    """
+    result = []
+    for i, p in enumerate(pred3):
+        if p == 0:
+            result.append(0)
+        elif p == 2:
+            result.append(3)
+        else:
+            area = estimate_cam_area(cams[i], cam_threshold) if i < len(cams) else 0.0
+            result.append(2 if area >= cam_threshold else 1)
+    return np.asarray(result, dtype=np.int64)
+
+
 # -----------------------------
 # 1. 确定性 General 拆分函数
 # -----------------------------
@@ -143,6 +188,7 @@ class SeverityDataset(Dataset):
         image_root: str,
         augment: bool,
         image_size: int = 224,
+        mode: str = "four_class_hash",
     ):
         self.df = pd.read_csv(metadata_csv)
         if len(self.df) == 0:
@@ -152,14 +198,20 @@ class SeverityDataset(Dataset):
         self.image_size = image_size
         self.augment = augment
 
-        # 生成 4-class severity
+        # 生成 4-class severity + 3-class原始标签
         self.df["severity_4class"] = self.df.apply(
             lambda row: map_severity_to_4class(int(row["severity"]), row["image_name"]),
             axis=1,
         )
+        self.df["severity"] = self.df["severity"].astype(int)
+        self.mode = mode
 
-        # 统计
-        self.class_counts = self.df["severity_4class"].value_counts().sort_index().to_dict()
+        # 统计（随模式切换）
+        if self.mode == "four_class_hash":
+            self.class_counts = self.df["severity_4class"].value_counts().sort_index().to_dict()
+        else:
+            # three_class / four_class_posthoc -> 使用三类标签的分布
+            self.class_counts = self.df["severity"].value_counts().sort_index().to_dict()
 
         self.transform = self._build_transform()
 
@@ -199,7 +251,10 @@ class SeverityDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, str]:
         row = self.df.iloc[idx]
-        label = int(row["severity_4class"])
+        if getattr(self, "mode", "four_class_hash") == "four_class_hash":
+            label = int(row["severity_4class"])  # 4类
+        else:
+            label = int(row["severity"])  # 3类（posthoc在验证阶段拆分）
         img_path = self.image_root / f"class_{row['label_61']:02d}" / row["image_name"]
 
         # 读图
@@ -481,16 +536,32 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
-    model: nn.Module, loader: DataLoader, device: torch.device, criterion: nn.Module
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+    mode: str = "four_class_hash",
+    cam_threshold: float = 0.35,
 ) -> Dict:
     model.eval()
     total_loss = 0.0
-    correct = 0
     total = 0
-    all_targets = []
-    all_preds = []
 
-    for images, labels, _ in tqdm(loader, desc="Val", ncols=100):
+    # We will always compute 4-class metrics for reporting
+    all_targets_4: List[int] = []
+    all_preds_4: List[int] = []
+
+    # Prepare Grad-CAM if we need posthoc split
+    use_posthoc = mode in ("three_class", "four_class_posthoc")
+    cam = None
+    if use_posthoc and GradCAM is not None and hasattr(model, "get_last_conv_layer"):
+        try:
+            target_layer = model.get_last_conv_layer()
+            cam = GradCAM(model=model, target_layers=[target_layer])
+        except Exception:
+            cam = None
+
+    for images, labels, names in tqdm(loader, desc="Val", ncols=100):
         images = images.to(device)
         labels = labels.to(device)
         logits = model(images)
@@ -498,15 +569,46 @@ def validate(
 
         batch_size = images.size(0)
         total_loss += loss.item() * batch_size
-        _, pred = logits.max(1)
-        correct += pred.eq(labels).sum().item()
         total += batch_size
 
-        all_targets.extend(labels.cpu().tolist())
-        all_preds.extend(pred.cpu().tolist())
+        if mode == "four_class_hash":
+            # Labels and predictions are already 4-class
+            _, pred = logits.max(1)
+            targets_4 = labels.cpu().tolist()
+            preds_4 = pred.cpu().tolist()
+        else:
+            # 3-class training; convert predictions to 4-class via CAM area
+            _, pred3 = logits.max(1)
+            pred3 = pred3.cpu().tolist()
+            preds_4 = []
+            for i, p in enumerate(pred3):
+                if p == 0:
+                    preds_4.append(0)  # Healthy
+                elif p == 2:
+                    preds_4.append(3)  # Serious -> Severe
+                else:
+                    # General -> Mild/Moderate by CAM area
+                    if cam is not None:
+                        try:
+                            grayscale_cam = cam(input_tensor=images[i].unsqueeze(0))[0]
+                            area = estimate_cam_area(grayscale_cam, cam_threshold)
+                        except Exception:
+                            area = 0.0
+                    else:
+                        area = 0.0
+                    preds_4.append(2 if area >= cam_threshold else 1)
 
-    metrics = compute_metrics(all_targets, all_preds)
-    metrics.update({"loss": total_loss / total, "acc": 100.0 * correct / total})
+            # Targets: derive deterministic 4-class from (0/1/2) + image_name (hash split for General)
+            labels_cpu = labels.cpu().tolist()
+            targets_4 = [map_severity_to_4class(int(l), names[i]) for i, l in enumerate(labels_cpu)]
+
+        all_targets_4.extend(targets_4)
+        all_preds_4.extend(preds_4)
+
+    # Compute final metrics on 4-class space
+    correct_4 = sum(1 for t, p in zip(all_targets_4, all_preds_4) if t == p)
+    metrics = compute_metrics(all_targets_4, all_preds_4)
+    metrics.update({"loss": total_loss / max(total, 1), "acc": 100.0 * correct_4 / max(total, 1)})
     return metrics
 
 
@@ -574,6 +676,46 @@ def run_gradcam(
 # -----------------------------
 # 6. 主训练逻辑
 # -----------------------------
+def plot_training_curves(history: Dict[str, List[float]], save_path: Path):
+    if not history or not history.get("epoch"):
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Training Progress", fontsize=16, fontweight="bold")
+
+    epochs = history["epoch"]
+
+    ax1 = axes[0]
+    ax1.plot(epochs, history.get("train_loss", []), "b-", label="Train Loss", linewidth=2)
+    ax1.plot(epochs, history.get("val_loss", []), "r-", label="Val Loss", linewidth=2)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Loss Curves", fontweight="bold")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    ax2 = axes[1]
+    ax2.plot(epochs, history.get("train_acc", []), "b-", label="Train Acc", linewidth=2)
+    ax2.plot(epochs, history.get("val_acc", []), "r-", label="Val Acc", linewidth=2)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy (%)")
+    ax2.set_title("Accuracy Curves", fontweight="bold")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    ax3 = axes[2]
+    ax3.plot(epochs, history.get("learning_rate", []), "g-", linewidth=2)
+    ax3.set_xlabel("Epoch")
+    ax3.set_ylabel("Learning Rate")
+    ax3.set_title("Learning Rate Schedule", fontweight="bold")
+    ax3.set_yscale("log")
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"Saved training curves: {save_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Task 3 - Severity 4-Class Training")
 
@@ -608,6 +750,19 @@ def main():
 
     parser.add_argument("--gradcam-samples", type=int, default=12)
     parser.add_argument("--no-gradcam", action="store_true")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="four_class_hash",
+        choices=["four_class_hash", "three_class", "four_class_posthoc"],
+        help="Severity training mode: 4-class hash split (default), 3-class training, or 3-class with CAM posthoc split to 4-class",
+    )
+    parser.add_argument(
+        "--cam-threshold",
+        type=float,
+        default=0.35,
+        help="CAM area threshold for splitting General into Mild/Moderate when mode=four_class_posthoc",
+    )
 
     args = parser.parse_args()
 
@@ -627,12 +782,14 @@ def main():
         image_root=args.image_root,
         augment=True,
         image_size=args.image_size,
+        mode=args.mode,
     )
     val_ds = SeverityDataset(
         metadata_csv=args.val_meta,
         image_root=args.val_image_root,
         augment=False,
         image_size=args.image_size,
+        mode=args.mode,
     )
 
     print("\nTrain severity distribution (4-class):", train_ds.class_counts)
@@ -667,9 +824,10 @@ def main():
     )
 
     # Model
+    num_outputs = 4 if args.mode == "four_class_hash" else 3
     model = SeverityClassifier(
         backbone=args.backbone,
-        num_classes=4,
+        num_classes=num_outputs,
         dropout=args.dropout,
     ).to(device)
 
@@ -720,7 +878,9 @@ def main():
             criterion=criterion,
             grad_clip=args.grad_clip,
         )
-        val_metrics = validate(model, val_loader, device, criterion)
+        val_metrics = validate(
+            model, val_loader, device, criterion, mode=args.mode, cam_threshold=args.cam_threshold
+        )
 
         scheduler.step()
 
@@ -757,6 +917,21 @@ def main():
                 "config": vars(args),
             }
             torch.save(ckpt, out_dir / "best.pth")
+            # Save best-epoch confusion matrix and recall bar
+            try:
+                if "confusion_matrix" in val_metrics and "per_class_recall" in val_metrics:
+                    plot_confusion_matrix(
+                        val_metrics["confusion_matrix"],
+                        ["Healthy", "Mild", "Moderate", "Severe"],
+                        out_dir / "confusion_matrix_best.png",
+                    )
+                    plot_recall_bar(
+                        val_metrics["per_class_recall"], out_dir / "recall_bar_best.png"
+                    )
+                with open(out_dir / "best_metrics.json", "w") as f:
+                    json.dump(val_metrics, f, indent=2)
+            except Exception as e:
+                print(f"Warning: failed to save best artifacts: {e}")
             print(f"✅ New best macro-F1={best_f1:.4f} (acc={best_acc:.2f}%), checkpoint saved.")
 
         if not args.save_best_only:
@@ -770,6 +945,11 @@ def main():
     # 保存最终历史
     with open(out_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
+    # 保存训练曲线图
+    try:
+        plot_training_curves(history, out_dir / "training_curves.png")
+    except Exception as e:
+        print(f"Training curves plot failed: {e}")
     print(f"\nTraining complete. Best macro-F1={best_f1:.4f}, acc={best_acc:.2f}%")
 
     # 打印最终详细指标
