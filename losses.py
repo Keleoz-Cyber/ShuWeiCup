@@ -128,14 +128,21 @@ class MultiTaskLoss(nn.Module):
         self,
         outputs: Dict[str, torch.Tensor],
         targets: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         """
         Args:
             outputs: Dict with keys 'label_61', 'crop', 'disease', 'severity'
             targets: Dict with same keys as outputs
 
         Returns:
-            total_loss: Weighted sum of all task losses
+            Dict with per-task losses and 'total' weighted sum:
+              {
+                'total': ...,
+                'label_61': ...,
+                'crop': ...,
+                'disease': ...,
+                'severity': ...
+              }
         """
         # Compute individual task losses
         loss_61 = self.criterion_61(outputs["label_61"], targets["label_61"])
@@ -151,7 +158,13 @@ class MultiTaskLoss(nn.Module):
             + self.task_weights["severity"] * loss_severity
         )
 
-        return total_loss
+        return {
+            "total": total_loss,
+            "label_61": loss_61,
+            "crop": loss_crop,
+            "disease": loss_disease,
+            "severity": loss_severity,
+        }
 
 
 class FocalLoss(nn.Module):

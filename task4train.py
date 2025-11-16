@@ -182,8 +182,10 @@ def multitask_collate(batch):
     动态任务权重不在这里更新，在主循环中做。
     """
     images = torch.stack([b[0] for b in batch])
-    labels = {k: torch.tensor([int(b[1][k]) for b in batch], dtype=torch.long)
-              for k in ["label_61", "crop", "disease", "severity"]}
+    labels = {
+        k: torch.tensor([int(b[1][k]) for b in batch], dtype=torch.long)
+        for k in ["label_61", "crop", "disease", "severity"]
+    }
     return images, labels
 
 
@@ -291,8 +293,8 @@ def generate_diagnostic_report(
                 "conf_crop": f"{crop_conf:.6f}",
                 "pred_disease": dis_pred,
                 "conf_disease": f"{dis_conf:.6f}",
-                "pred_severity4": sev_pred,
-                "conf_severity4": f"{sev_conf:.6f}",
+                "pred_severity3": sev_pred,
+                "conf_severity3": f"{sev_conf:.6f}",
             }
 
             # If true labels available in loader, append correctness
@@ -300,9 +302,9 @@ def generate_diagnostic_report(
                 true_l61 = int(labels["label_61"][i].item())
                 true_sev = int(labels["severity"][i].item())
                 row["true_label_61"] = true_l61
-                row["true_severity4"] = true_sev
+                row["true_severity3"] = true_sev
                 row["correct_61"] = int(true_l61 == l61_pred)
-                row["correct_severity4"] = int(true_sev == sev_pred)
+                row["correct_severity3"] = int(true_sev == sev_pred)
 
             rows.append(row)
 
@@ -348,8 +350,8 @@ def generate_diagnostic_report(
                 "conf_crop",
                 "pred_disease",
                 "conf_disease",
-                "pred_severity4",
-                "conf_severity4",
+                "pred_severity3",
+                "conf_severity3",
             ]
         )
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -367,10 +369,10 @@ def evaluate_severity_metrics(model: nn.Module, loader: DataLoader, device: torc
     model.eval()
     all_t, all_p = [], []
     for batch in loader:
-            if len(batch) == 3:
-                images, labels, _ = batch
-            else:
-                images, labels = batch
+        if len(batch) == 3:
+            images, labels, _ = batch
+        else:
+            images, labels = batch
         images = images.to(device)
         logits = model(images)["severity"]
         probs = F.softmax(logits, dim=1)
@@ -383,11 +385,11 @@ def evaluate_severity_metrics(model: nn.Module, loader: DataLoader, device: torc
         return {
             "accuracy": 0.0,
             "macro_f1": 0.0,
-            "confusion_matrix": [[0, 0, 0, 0] for _ in range(4)],
+            "confusion_matrix": [[0, 0, 0], [0, 0, 0], [0, 0, 0]],
         }
     acc = (np.array(all_t) == np.array(all_p)).mean()
     macro = f1_score(all_t, all_p, average="macro")
-    cm = confusion_matrix(all_t, all_p, labels=[0, 1, 2, 3]).tolist()
+    cm = confusion_matrix(all_t, all_p, labels=[0, 1, 2]).tolist()
     return {"accuracy": acc, "macro_f1": macro, "confusion_matrix": cm}
 
 
@@ -442,11 +444,24 @@ def main():
         "--class-weights-severity",
         type=str,
         default=None,
-        help="CSV path with 'class_id,weight' for severity 4-class",
+        help="CSV path with 'class_id,weight' for severity 3-class",
     )
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument(
         "--task-weights", type=str, default="1.0,0.3,0.3,0.6", help="w61,wcrop,wdisease,wseverity"
+    )
+    # Dynamic task weights and primary task control
+    parser.add_argument(
+        "--dynamic-task-weights",
+        action="store_true",
+        help="Enable dynamic task weights (inverse validation loss EMA with smoothing)",
+    )
+    parser.add_argument(
+        "--primary-task",
+        type=str,
+        default="label_61",
+        choices=["label_61", "crop", "disease", "severity"],
+        help="Primary task used for overall accuracy/early stopping",
     )
 
     # Output
@@ -565,7 +580,7 @@ def main():
         if args.class_weights_severity and Path(args.class_weights_severity).exists():
             df = pd.read_csv(args.class_weights_severity)
             w = torch.tensor(df["weight"].values, dtype=torch.float32, device=device)
-            if w.numel() == 4:
+            if w.numel() == 3:
                 class_weights_sev = w
                 print(f"Loaded class weights for severity: shape={tuple(w.shape)}")
             else:
@@ -606,6 +621,9 @@ def main():
         use_tensorboard=True,
         multi_task=True,
     )
+    # Configure trainer behavior
+    trainer.primary_task = args.primary_task
+    trainer.dynamic_task_weights = args.dynamic_task_weights
 
     # Train multitask
     trainer.train(num_epochs=args.epochs, save_freq=args.save_freq)
@@ -644,7 +662,7 @@ def main():
             num_classes_61=61,
             num_crops=10,
             num_diseases=28,
-            num_severity=4,
+            num_severity=3,
         ).to(device)
 
         optimizer2 = torch.optim.AdamW(
@@ -676,6 +694,8 @@ def main():
             use_tensorboard=True,
             multi_task=True,
         )
+        trainer2.primary_task = args.primary_task
+        trainer2.dynamic_task_weights = args.dynamic_task_weights
 
         trainer2.train(num_epochs=args.compare_epochs, save_freq=max(1, args.compare_epochs // 2))
 

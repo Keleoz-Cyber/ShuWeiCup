@@ -213,6 +213,19 @@ class MultiTaskModel(nn.Module):
 
         return outputs
 
+    def get_last_conv_layer(self):
+        """
+        Return the last convolutional layer for Grad-CAM.
+        We iterate modules of the backbone and grab the last nn.Conv2d.
+        """
+        last_conv = None
+        for m in self.backbone.modules():
+            if isinstance(m, nn.Conv2d):
+                last_conv = m
+        if last_conv is None:
+            raise RuntimeError("No conv layer found for Grad-CAM.")
+        return last_conv
+
     def get_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract pooled features"""
         feature_maps = self.backbone(x)
