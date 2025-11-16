@@ -108,78 +108,77 @@ class AgriDiseaseDataset(Dataset):
 
 def get_train_transform(image_size: int = 224) -> A.Compose:
     """
-    Training data augmentation.
+    Training data augmentation (moderated).
 
-    Start conservative - we can always add more augmentation later.
-    Premature optimization is the root of all evil.
+    Previous version was overly aggressive (elastic/optical/shadow/fog + heavy dropout)
+    which can destroy subtle lesion textures. Good taste: keep only transforms
+    that preserve pathological signal while adding diversity.
     """
     return A.Compose(
         [
-            # Stronger resize for better resolution
-            A.Resize(int(image_size * 1.2), int(image_size * 1.2)),  # 270 for 224
-            A.RandomCrop(image_size, image_size),
-            # Basic flips - more aggressive for crops
+            # Random resized crop (scale keeps texture, adds position variance)
+            A.RandomResizedCrop(image_size, image_size, scale=(0.85, 1.0), ratio=(0.9, 1.1), p=1.0),
+            # Orientation variance (fields can flip)
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.3),  # Crops can appear upside down in fields
-            # Stronger geometric transforms for extreme imbalance
+            A.VerticalFlip(p=0.2),
+            # Mild geometric perturbation (smaller than before)
             A.ShiftScaleRotate(
-                shift_limit=0.1,  # More shift
-                scale_limit=0.2,  # More scale variation
-                rotate_limit=45,  # Full rotation for leaves
-                p=0.7,  # Higher probability
+                shift_limit=0.05,
+                scale_limit=0.10,
+                rotate_limit=25,
+                p=0.5,
             ),
-            # Color augmentation - critical for disease recognition
+            # Color jitter (reduced strength to avoid masking chlorosis patterns)
+            A.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.08,
+                p=0.7,
+            ),
+            # Light blur/noise (avoid motion blur; keep Gaussian + slight noise)
             A.OneOf(
                 [
-                    A.ColorJitter(
-                        brightness=0.3,  # Stronger
-                        contrast=0.3,
-                        saturation=0.3,
-                        hue=0.15,
-                    ),
-                    A.HueSaturationValue(
-                        hue_shift_limit=30,  # More variation
-                        sat_shift_limit=40,
-                        val_shift_limit=30,
-                    ),
-                    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1.0),
-                ],
-                p=0.8,  # Much higher probability
-            ),
-            # Blur and noise - simulate real-world conditions
-            A.OneOf(
-                [
-                    A.GaussianBlur(blur_limit=(3, 7)),
-                    A.MotionBlur(blur_limit=5),
-                    A.GaussNoise(var_limit=(10.0, 80.0)),
-                ],
-                p=0.5,  # Higher probability
-            ),
-            # Cutout for regularization - critical for small datasets
-            A.CoarseDropout(
-                max_holes=12,  # More holes
-                max_height=int(image_size * 0.15),  # Larger holes
-                max_width=int(image_size * 0.15),
-                min_holes=3,
-                fill_value=0,
-                p=0.5,  # Much higher probability
-            ),
-            # Additional transforms for extreme imbalance
-            A.OneOf(
-                [
-                    A.GridDistortion(p=1.0),
-                    A.ElasticTransform(p=1.0),
-                    A.OpticalDistortion(p=1.0),
+                    A.GaussianBlur(blur_limit=(3, 5)),
+                    A.GaussNoise(var_limit=(10.0, 40.0)),
                 ],
                 p=0.3,
             ),
-            # Random shadows/fog for environmental variation
-            A.OneOf(
-                [
-                    A.RandomShadow(p=1.0),
-                    A.RandomFog(p=1.0),
-                ],
-                p=0.2,
+            # Reduced coarse dropout (fewer holes; avoid erasing all lesions)
+            A.CoarseDropout(
+                max_holes=6,
+                max_height=int(image_size * 0.12),
+                max_width=int(image_size * 0.12),
+                min_holes=2,
+                fill_value=0,
+                p=0.3,
+            ),
+            # Normalize
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+            ToTensorV2(),
+        ]
+    )
+
+
+def get_light_train_transform(image_size: int = 224) -> A.Compose:
+    """
+    Extra-light augmentation variant for fine-tuning late stages or EMA evaluation.
+
+    Use when model starts overfitting with standard train transform.
+    """
+    return A.Compose(
+        [
+            A.Resize(image_size, image_size),
+            A.HorizontalFlip(p=0.5),
+            A.ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.15,
+                hue=0.05,
+                p=0.5,
             ),
             A.Normalize(
                 mean=[0.485, 0.456, 0.406],

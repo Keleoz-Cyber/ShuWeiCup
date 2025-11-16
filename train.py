@@ -13,8 +13,14 @@ Usage:
 """
 
 import argparse
+
+# ===============================
+# Helper Utilities (Sampler / EMA / Mixup-CutMix / Custom Loop)
+# ===============================
+import math
 import random
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -26,6 +32,207 @@ from dataset import AgriDiseaseDataset, collate_fn, get_train_transform, get_val
 from losses import create_loss_function
 from models import create_model
 from trainer import Trainer
+
+
+def build_weighted_sampler(metadata_df, label_col: str = "label_61", power: float = 0.5):
+    """
+    Build a WeightedRandomSampler with inverse freq^power weights.
+    power=0.5 => inverse sqrt frequency (stabilizes extreme long-tail).
+    """
+    from collections import Counter
+
+    counts = Counter(metadata_df[label_col].tolist())
+    weights = [1.0 / (counts[label] ** power) for label in metadata_df[label_col]]
+
+    return torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model parameters.
+    Keeps a shadow copy updated each step for more stable validation.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].mul_(d).add_(param.data, alpha=(1.0 - d))
+
+    def apply_to(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                param.data.copy_(self.shadow[name])
+
+
+def apply_mixup_cutmix(
+    images: torch.Tensor,
+    targets: torch.Tensor,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    mixup_prob: float,
+    cutmix_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """
+    Decide between Mixup / CutMix / None each batch.
+    Returns (images, targets_a, targets_b, lambda)
+    """
+    lam = 1.0
+    use_mixup = mixup_alpha > 0 and np.random.rand() < mixup_prob
+    use_cutmix = (not use_mixup) and cutmix_alpha > 0 and np.random.rand() < cutmix_prob
+    batch_size = images.size(0)
+    device = images.device
+    index = torch.randperm(batch_size, device=device)
+
+    if use_mixup:
+        lam = np.random.beta(mixup_alpha, mixup_alpha)
+        mixed = lam * images + (1 - lam) * images[index]
+        return mixed, targets, targets[index], lam
+    elif use_cutmix:
+        lam = np.random.beta(cutmix_alpha, cutmix_alpha)
+        # Generate random bounding box
+        H, W = images.size(2), images.size(3)
+        cut_rat = math.sqrt(1.0 - lam)
+        cut_h = int(H * cut_rat)
+        cut_w = int(W * cut_rat)
+        cy = np.random.randint(0, H)
+        cx = np.random.randint(0, W)
+        y1 = np.clip(cy - cut_h // 2, 0, H)
+        y2 = np.clip(cy + cut_h // 2, 0, H)
+        x1 = np.clip(cx - cut_w // 2, 0, W)
+        x2 = np.clip(cx + cut_w // 2, 0, W)
+        images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+        lam = 1.0 - ((x2 - x1) * (y2 - y1) / (H * W))
+        return images, targets, targets[index], lam
+    else:
+        return images, targets, targets, lam
+
+
+def custom_train_loop(
+    model: nn.Module,
+    optimizer,
+    scheduler,
+    criterion,
+    device,
+    train_loader,
+    val_loader,
+    epochs: int,
+    use_amp: bool,
+    multi_task: bool,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    mixup_prob: float,
+    cutmix_prob: float,
+    save_dir: str,
+    ema: Optional[ModelEMA] = None,
+):
+    """
+    Minimal custom training loop supporting sampler, Mixup/CutMix, EMA.
+    Prints epoch metrics similar to Trainer.
+    """
+    # Type assertions to satisfy static analyzer
+    assert isinstance(model, nn.Module), "model must be nn.Module"
+    assert scheduler is None or hasattr(scheduler, "step"), (
+        "scheduler must implement step() or be None"
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+
+    def run_val(current_epoch: int):
+        model.eval()
+        correct = 0
+        total = 0
+        total_loss = 0.0
+        with torch.inference_mode():
+            for images, labels in val_loader:
+                images = images.to(device)
+                if device.type == "cuda":
+                    images = images.to(memory_format=torch.channels_last)
+                targets = labels["label_61"] if multi_task else labels["label_61"]
+                targets = targets.to(device)
+                outputs = model(images) if not multi_task else model(images)["label_61"]
+                loss = criterion(outputs, targets)
+                total_loss += loss.item() * images.size(0)
+                preds = outputs.argmax(1)
+                correct += preds.eq(targets).sum().item()
+                total += images.size(0)
+        acc = 100.0 * correct / total
+        print(f"  [Val] Epoch {current_epoch} | Loss {total_loss / total:.4f} | Acc {acc:.2f}%")
+        return acc, total_loss / total
+
+    best_acc = 0.0
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        for images, labels in train_loader:
+            images = images.to(device)
+            if device.type == "cuda":
+                images = images.to(memory_format=torch.channels_last)
+            targets = labels["label_61"] if multi_task else labels["label_61"]
+            targets = targets.to(device)
+            images_aug, ta, tb, lam = apply_mixup_cutmix(
+                images, targets, mixup_alpha, cutmix_alpha, mixup_prob, cutmix_prob
+            )
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
+                outputs_all = model(images_aug)
+                outputs = outputs_all if not multi_task else outputs_all["label_61"]
+                loss = lam * criterion(outputs, ta) + (1 - lam) * criterion(outputs, tb)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            if ema:
+                ema.update(model)
+            batch_size = images.size(0)
+            total += batch_size
+            total_loss += loss.item() * batch_size
+            preds = outputs.argmax(1)
+            correct += preds.eq(targets).sum().item()
+        if scheduler:
+            scheduler.step()
+        train_acc = 100.0 * correct / total
+        train_loss = total_loss / total
+        print(
+            f"Epoch {epoch}/{epochs} | Train Loss {train_loss:.4f} | Train Acc {train_acc:.2f}% | LR {optimizer.param_groups[0]['lr']:.6f}"
+        )
+        # Validation with EMA shadow if enabled
+        if ema:
+            saved = {n: p.data.clone() for n, p in model.named_parameters() if p.requires_grad}
+            ema.apply_to(model)
+            val_acc, val_loss = run_val(epoch)
+            # Restore params
+            for n, p in model.named_parameters():
+                if p.requires_grad and n in saved:
+                    p.data.copy_(saved[n])
+        else:
+            val_acc, val_loss = run_val(epoch)
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "best_val_acc": best_acc,
+                },
+                Path(save_dir) / "best_custom.pth",
+            )
+            print(f"  ✅ New best (custom loop) val acc: {best_acc:.2f}%")
+    print(f"\nCustom training finished. Best Val Acc: {best_acc:.2f}%")
 
 
 def set_seed(seed: int = 42):
@@ -137,8 +344,8 @@ def parse_args():
     parser.add_argument(
         "--label-smoothing",
         type=float,
-        default=0.1,
-        help="Label smoothing factor",
+        default=0.05,
+        help="Label smoothing factor (reduced for long-tail stability)",
     )
     parser.add_argument(
         "--image-size",
@@ -183,12 +390,7 @@ def parse_args():
         default=True,
         help="Use automatic mixed precision",
     )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        default=True,
-        help="Use torch.compile for 20-50%% speedup",
-    )
+    # Removed --compile option (torch.compile disabled to simplify training and avoid type issues)
 
     # Misc
     parser.add_argument(
@@ -226,6 +428,48 @@ def parse_args():
         type=str,
         default=None,
         help="Resume from checkpoint",
+    )
+
+    # Advanced sampling & augmentation & EMA arguments
+    parser.add_argument(
+        "--balance-sampler",
+        action="store_true",
+        help="Use inverse sqrt frequency WeightedRandomSampler for long-tail balancing",
+    )
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.4,
+        help="Mixup alpha (0 to disable Mixup)",
+    )
+    parser.add_argument(
+        "--mixup-prob",
+        type=float,
+        default=0.7,
+        help="Probability to apply Mixup each batch",
+    )
+    parser.add_argument(
+        "--cutmix-alpha",
+        type=float,
+        default=0.6,
+        help="CutMix alpha (0 to disable CutMix)",
+    )
+    parser.add_argument(
+        "--cutmix-prob",
+        type=float,
+        default=0.5,
+        help="Probability to apply CutMix if Mixup not selected",
+    )
+    parser.add_argument(
+        "--use-ema",
+        action="store_true",
+        help="Enable EMA of model weights for more stable evaluation",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay (0.999 typical, larger = slower updates)",
     )
 
     args = parser.parse_args()
@@ -298,15 +542,24 @@ def main():
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
-    # Create dataloaders with device-optimized settings
+    # Create dataloaders with device-optimized settings (with optional balanced sampler)
+    sampler = None
+    if args.balance_sampler:
+        try:
+            sampler = build_weighted_sampler(train_dataset.metadata, label_col="label_61")
+            print("✅ Using WeightedRandomSampler (inverse sqrt frequency)")
+        except Exception as e:
+            print(f"⚠️ Failed to build sampler ({e}), falling back to shuffle.")
+            sampler = None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
         num_workers=optimal_workers,
         pin_memory=use_pin_memory,
         persistent_workers=use_persistent,
         collate_fn=collate_fn,
+        sampler=sampler,
     )
 
     val_loader = DataLoader(
@@ -335,32 +588,19 @@ def main():
         dropout=args.dropout,
         num_classes=61,
     )
+    # Type safety assertion
+    assert isinstance(model, nn.Module), "create_model must return nn.Module"
     model = model.to(device)
+    # Preserve an uncompiled reference for EMA / Trainer (raw_model) before any optional compilation
+    raw_model = model
 
     # Optimize memory layout for better performance (CUDA only - MPS has issues)
     if device.type == "cuda":
-        model = model.to(memory_format=torch.channels_last)
-        print("Using channels_last memory format for better performance")
+        # Removed invalid model.to(memory_format=...) call; channels_last will be applied to input tensors in the loop
+        print("CUDA device detected - will use channels_last on batch tensors")
 
-    # torch.compile for 20-50% speedup (PyTorch 2.0+)
-    # MPS: disabled due to stride mismatch bugs in convolution_backward
-    if args.compile and device.type != "mps":
-        try:
-            print("\nCompiling model with torch.compile...")
-            if device.type == "cuda":
-                # CUDA: use max-autotune for best performance
-                model = torch.compile(model, mode="reduce-overhead")
-            else:
-                # CPU: use default mode
-                model = torch.compile(model)
-            print("✅ Model compiled successfully")
-        except Exception as e:
-            print(f"⚠️  torch.compile failed ({e}), continuing without compilation")
-    elif args.compile and device.type == "mps":
-        print("\n⚠️  torch.compile disabled on MPS (known bugs with convolution_backward)")
-        print("    See: https://github.com/pytorch/pytorch/issues")
-    else:
-        print("\ntorch.compile disabled (use --compile to enable)")
+    # torch.compile removed: keep raw_model for all training to reduce complexity
+    compiled_model = raw_model
 
     # Create loss function
     print("\nCreating loss function...")
@@ -428,12 +668,20 @@ def main():
 
     # Create trainer
     print("\nInitializing trainer...")
+    # Cast scheduler only if it's an _LRScheduler, otherwise pass None (custom loop handles advanced schedulers)
+    if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler._LRScheduler):
+        print(
+            "Scheduler is not _LRScheduler; passing None to Trainer (will still be used in custom loop if enabled)."
+        )
+        trainer_scheduler = None
+    else:
+        trainer_scheduler = scheduler
     trainer = Trainer(
-        model=model,
+        model=raw_model,
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
-        scheduler=scheduler,
+        scheduler=trainer_scheduler,
         criterion=criterion,
         device=device,
         save_dir=args.save_dir,
@@ -453,15 +701,47 @@ def main():
     print("Starting training...")
     print("=" * 60)
 
-    try:
-        trainer.train(num_epochs=args.epochs, save_freq=args.save_freq)
-    except KeyboardInterrupt:
-        print("\n\nTraining interrupted by user")
-        print("Saving current state...")
-        trainer.save_checkpoint("interrupted.pth", {"status": "interrupted"})
-    except Exception as e:
-        print(f"\n\nTraining failed with error: {e}")
-        raise
+    # Decide training path: if advanced features requested, use custom loop
+    advanced_path = (
+        args.balance_sampler or (args.mixup_alpha > 0) or (args.cutmix_alpha > 0) or args.use_ema
+    )
+    ema_obj = None
+    if advanced_path and args.use_ema:
+        ema_obj = ModelEMA(model, decay=args.ema_decay)
+        print(f"✅ EMA enabled (decay={args.ema_decay})")
+    if advanced_path:
+        print("\n=== Using custom training loop (EMA / Mixup / CutMix / Sampler) ===")
+        # Use compiled_model only for the forward/backward path; EMA shadows raw_model parameters
+        custom_train_loop(
+            model=raw_model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            criterion=criterion,
+            device=device,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=args.epochs,
+            use_amp=args.use_amp,
+            multi_task=(args.model_type == "multitask"),
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+            mixup_prob=args.mixup_prob,
+            cutmix_prob=args.cutmix_prob,
+            save_dir=args.save_dir,
+            ema=ema_obj,
+        )
+        print("\nCustom loop finished. Skipping Trainer.train().")
+    else:
+        try:
+            trainer.train(num_epochs=args.epochs, save_freq=args.save_freq)
+        except KeyboardInterrupt:
+            print("\n\nTraining interrupted by user")
+            print("Saving current state...")
+            # Provide an empty metrics dict (Dict[str, float]) to satisfy type expectations
+            trainer.save_checkpoint("interrupted.pth", {})
+        except Exception as e:
+            print(f"\n\nTraining failed with error: {e}")
+            raise
 
     print("\n" + "=" * 60)
     print("Training completed successfully!")
