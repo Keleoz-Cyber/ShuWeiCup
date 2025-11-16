@@ -1,41 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Task 4: Multi-Task Joint Learning and Interpretable Diagnosis
-=============================================================
+Task 4: Multi-Task Joint Learning and Interpretable Diagnosis (REFINED)
+=======================================================================
 
-哥，本脚本完成多任务联合训练（疾病61类 + 作物10类 + 疾病类型(含None) + 严重程度4类），
-并支持生成可读诊断报告、以及“多任务 vs 严重度单任务”的协同效应对比。
+哥，按你的最新指令：
+- 把严重度从“伪4类”改回真实 3 类：0=Healthy, 1=General, 2=Serious
+- 移除哈希 Mild/Moderate 拆分（比赛题目原描述有误）
+- 增加动态任务权重 (--dynamic-task-weights) ：基于每任务最近一个验证损失的倒数归一，再平滑
+- 报告中输出可读中文 / 英文名称（作物、疾病、严重度）
+- 协同效应对比时真正裁剪模型，只保留严重度 head（避免浪费算力）
+- 诊断报告对应 3 类严重度（新增列 severity_name）
+- 仍支持 Grad-CAM，可视化热区
+- 保留固定权重模式 (--task-weights) 与动态模式互斥（动态模式优先生效）
 
-要点：
-- 严重度4类：0=Healthy，1=Mild，2=Moderate，3=Severe
-  数据原始只有0/1/2(健康/一般/严重)。我们采用确定性的哈希拆分把General拆成 Mild/Moderate。
-  不引入人工噪声；映射稳定可复现。
-- 联合训练：共享backbone，四个head，权重可调（--task-weights）。
-- 报告生成：每张图输出 61类Top3、Crop、Disease、Severity 的预测与置信度；可选Grad-CAM。
-- 协同效应对比：可选启用 --compare-synergy，在同一脚本中再跑一轮“仅严重度任务”的训练，
-  比较严重度的精度与F1，生成 synergy_comparison.json。
-
-依赖：
-- 复用本仓库已有模块：dataset.py（变换参考）、models.py（MultiTaskModel）、losses.py（MultiTaskLoss）、trainer.py（Trainer）
-- 可选 grad-cam 库用于可视化（pyproject 已包含）
-
-示例：
+命令示例：
   python task4train.py \
     --train-meta data/cleaned/metadata/train_metadata.csv \
     --val-meta data/cleaned/metadata/val_metadata.csv \
     --train-dir data/cleaned/train \
     --val-dir data/cleaned/val \
-    --epochs 30 \
+    --epochs 25 \
     --batch-size 64 \
     --lr 3e-4 \
-    --out-dir checkpoints/task4_multitask \
-    --use-class-weights \
-    --task-weights 1.0,0.3,0.3,0.6 \
-    --compare-synergy \
-    --compare-epochs 10 \
-    --report-samples 30 \
-    --cam-samples 12
+    --task-weights 1.0,0.3,0.3,0.4 \
+    --dynamic-task-weights \
+    --report-samples 50 \
+    --cam-samples 12 \
+    --compare-synergy --compare-epochs 8 \
+    --out-dir checkpoints/task4_multitask
 
 """
 
@@ -78,32 +71,31 @@ from albumentations.pytorch import ToTensorV2
 
 
 # =========================
-# Severity 4-class mapping
+# Severity 3-class mapping
 # =========================
-def map_severity_to_4class(original_severity: int, image_name: str) -> int:
+def map_severity_to_3class(original_severity: int) -> int:
     """
-    0(H) -> 0, 2(Serious) -> 3, 1(General) -> [Mild(1) or Moderate(2)] by deterministic hashing.
+    保持原始真实标签：
+      0 -> Healthy
+      1 -> General
+      2 -> Serious
+    不再做哈希拆分；比赛题目“4类”描述错误，这里回归真实数据。
     """
-    if original_severity == 0:
-        return 0
-    if original_severity == 2:
-        return 3
-    h = hashlib.md5(image_name.encode("utf-8")).hexdigest()
-    last_hex_digit = h[-1]
-    parity = int(last_hex_digit, 16) % 2
-    return 1 if parity == 0 else 2
+    if original_severity in (0, 1, 2):
+        return int(original_severity)
+    raise ValueError(f"Invalid severity value: {original_severity}")
 
 
 # =========================
 # Dataset (multi-task, sev4)
 # =========================
-class MultiTaskSeverity4Dataset(Dataset):
+class MultiTaskSeverity3Dataset(Dataset):
     """
-    读取元数据CSV，图像组织为 data_dir/class_XX/image_name
+    多任务数据集（严重度 3 类）。
     返回：
       image: Tensor [3,H,W]
-      labels: dict(label_61, crop, disease, severity[4-class])
-      meta: dict 保留 image_name 供报告/可视化
+      labels: dict(label_61, crop, disease, severity[0..2])
+      meta: dict 包含 image_name 与可读名称字段
     """
 
     def __init__(
@@ -120,16 +112,14 @@ class MultiTaskSeverity4Dataset(Dataset):
         if len(self.df) == 0:
             raise ValueError(f"Empty metadata: {metadata_csv}")
 
-        self.df["severity4"] = self.df.apply(
-            lambda r: map_severity_to_4class(int(r["severity"]), r["image_name"]), axis=1
-        )
+        self.df["severity3"] = self.df["severity"].apply(map_severity_to_3class)
 
         self.augment = augment
         self.image_size = image_size
         self.transform = self._build_transform(augment, image_size)
 
         # 分布统计
-        self.class_counts = self.df["severity4"].value_counts().sort_index().to_dict()
+        self.class_counts = self.df["severity3"].value_counts().sort_index().to_dict()
 
     def _build_transform(self, augment: bool, image_size: int) -> A.Compose:
         if augment:
@@ -162,7 +152,7 @@ class MultiTaskSeverity4Dataset(Dataset):
         label_61 = int(row["label_61"])
         crop_id = int(row["crop_id"])
         disease_id = int(row["disease_id"])
-        severity4 = int(row["severity4"])
+        severity3 = int(row["severity3"])
 
         class_folder = f"class_{label_61:02d}"
         image_path = self.data_dir / class_folder / row["image_name"]
@@ -177,7 +167,7 @@ class MultiTaskSeverity4Dataset(Dataset):
             "label_61": label_61,
             "crop": crop_id,
             "disease": disease_id,
-            "severity": severity4,  # already 4-class
+            "severity": severity3,  # 3-class
         }
         meta = {
             "image_name": row["image_name"],
@@ -187,12 +177,26 @@ class MultiTaskSeverity4Dataset(Dataset):
 
 
 def multitask_collate(batch):
+    """
+    训练用 collate（不带 meta）。
+    动态任务权重不在这里更新，在主循环中做。
+    """
+    images = torch.stack([b[0] for b in batch])
+    labels = {k: torch.tensor([int(b[1][k]) for b in batch], dtype=torch.long)
+              for k in ["label_61", "crop", "disease", "severity"]}
+    return images, labels
+
+
+def report_collate(batch):
+    """
+    Reporting / diagnostic collate: returns (images, labels, meta).
+    """
     images = torch.stack([b[0] for b in batch])
     labels = {}
     for key in ["label_61", "crop", "disease", "severity"]:
         labels[key] = torch.tensor([int(b[1][key]) for b in batch], dtype=torch.long)
-    meta = [b[2] for b in batch]
-    return images, labels, meta
+    metas = [b[2] for b in batch]
+    return images, labels, metas
 
 
 # =========================
@@ -362,7 +366,11 @@ def generate_diagnostic_report(
 def evaluate_severity_metrics(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict:
     model.eval()
     all_t, all_p = [], []
-    for images, labels, _ in loader:
+    for batch in loader:
+            if len(batch) == 3:
+                images, labels, _ = batch
+            else:
+                images, labels = batch
         images = images.to(device)
         logits = model(images)["severity"]
         probs = F.softmax(logits, dim=1)
@@ -483,16 +491,16 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Datasets / loaders
-    train_ds = MultiTaskSeverity4Dataset(
+    train_ds = MultiTaskSeverity3Dataset(
         data_dir=args.train_dir,
         metadata_csv=args.train_meta,
         augment=True,
         image_size=args.image_size,
     )
-    val_ds = MultiTaskSeverity4Dataset(
+    val_ds = MultiTaskSeverity3Dataset(
         data_dir=args.val_dir, metadata_csv=args.val_meta, augment=False, image_size=args.image_size
     )
-    print("\nSeverity(4) distribution:")
+    print("\nSeverity(3) distribution:")
     print(f"  Train: {train_ds.class_counts}")
     print(f"  Val  : {val_ds.class_counts}")
 
@@ -505,7 +513,7 @@ def main():
         num_workers=num_workers,
         pin_memory=pin,
         drop_last=False,
-        collate_fn=multitask_collate,
+        collate_fn=multitask_collate,  # yields (images, labels)
     )
     val_loader = DataLoader(
         val_ds,
@@ -514,7 +522,17 @@ def main():
         num_workers=num_workers,
         pin_memory=pin,
         drop_last=False,
-        collate_fn=multitask_collate,
+        collate_fn=multitask_collate,  # yields (images, labels)
+    )
+    # Separate loader for diagnostic reporting (needs meta)
+    val_report_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin,
+        drop_last=False,
+        collate_fn=report_collate,  # yields (images, labels, meta)
     )
 
     # Model
@@ -525,7 +543,7 @@ def main():
         num_classes_61=61,
         num_crops=10,
         num_diseases=28,
-        num_severity=4,
+        num_severity=3,  # changed to 3-class severity
     ).to(device)
 
     # Class weights (optional)
@@ -555,8 +573,13 @@ def main():
 
     # Loss
     task_w = parse_task_weights(args.task_weights)
+    # 动态任务权重初始化（如果启用）
+    dynamic_weights = None
+    if args.dynamic_task_weights:
+        dynamic_weights = task_w.copy()
+        print(f"[DynamicTaskWeights] Initialized: {dynamic_weights}")
     criterion = MultiTaskLoss(
-        task_weights=task_w,
+        task_weights=(dynamic_weights if dynamic_weights else task_w),
         class_weights_61=class_weights_61,
         class_weights_severity=class_weights_sev,
         label_smoothing=args.label_smoothing,
@@ -597,7 +620,7 @@ def main():
     # Diagnostic report (CSV) + optional CAM
     generate_diagnostic_report(
         model=model,
-        loader=val_loader,
+        loader=val_report_loader,  # use loader with meta
         device=device,
         out_csv=out_dir / "diagnostic_report_multitask.csv",
         max_samples=args.report_samples,

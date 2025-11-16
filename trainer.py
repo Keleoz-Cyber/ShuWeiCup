@@ -120,8 +120,11 @@ class Trainer:
         """
         Train for one epoch.
 
-        Returns:
-            Dict of metrics (loss, accuracy, etc.)
+        Supports:
+          - Batches optionally containing meta: (images, labels) or (images, labels, meta)
+          - Criterion returning either a scalar Tensor OR a dict with per-task losses
+          - Dynamic task weights (inverse validation loss EMA) updated in validate()
+          - Primary task selection (default 'label_61') for overall accuracy
         """
         self.model.train()
 
@@ -129,9 +132,11 @@ class Trainer:
         total_correct = 0
         total_samples = 0
 
+        primary_task = getattr(self, "primary_task", "label_61")
+
         # Multi-task metrics
         if self.multi_task:
-            task_losses = {
+            task_losses_accum = {
                 "label_61": 0.0,
                 "crop": 0.0,
                 "disease": 0.0,
@@ -146,7 +151,13 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
-        for batch_idx, (images, labels) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            # Unpack flexible batch
+            if len(batch) == 3:
+                images, labels, _meta = batch
+            else:
+                images, labels = batch
+
             # Move to device - use non_blocking for GPU to overlap transfer
             non_blocking = self.device.type in ["cuda", "mps"]
             images = images.to(self.device, non_blocking=non_blocking)
@@ -156,44 +167,45 @@ class Trainer:
                 images = images.to(memory_format=torch.channels_last)
 
             if self.multi_task:
-                # Multi-task labels
                 labels = {
                     k: v.to(self.device, non_blocking=non_blocking) for k, v in labels.items()
                 }
             else:
-                # Single task
                 labels = labels["label_61"].to(self.device, non_blocking=non_blocking)
 
             # Forward pass with AMP
             if self.use_amp:
                 with autocast(device_type=self.device.type):
-                    if self.multi_task:
-                        outputs = self.model(images)
-                        loss = self.criterion(outputs, labels)
-                    else:
-                        outputs = self.model(images)
-                        loss = self.criterion(outputs, labels)
+                    outputs = self.model(images)
+                    raw_loss = self.criterion(outputs, labels)
             else:
-                if self.multi_task:
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, labels)
-                else:
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, labels)
+                outputs = self.model(images)
+                raw_loss = self.criterion(outputs, labels)
 
-            # Backward pass - zero_grad with set_to_none for better performance
+            # Normalize loss object
+            if isinstance(raw_loss, dict):
+                loss = raw_loss.get("total", None)
+                if loss is None:
+                    # Aggregate manually if 'total' not provided
+                    loss = sum(
+                        w * raw_loss[k]
+                        for k, w in getattr(self.criterion, "task_weights", {}).items()
+                        if k in raw_loss
+                    )
+            else:
+                loss = raw_loss  # tensor
+
+            # Backward pass
             self.optimizer.zero_grad(set_to_none=True)
 
             if self.use_amp:
                 self.scaler.scale(loss).backward()
-                # Gradient clipping for stability
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                # Gradient clipping for stability
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
 
@@ -202,24 +214,23 @@ class Trainer:
             total_samples += batch_size
 
             if self.multi_task:
-                # Multi-task metrics
                 total_loss += loss.item() * batch_size
 
-                # Primary task accuracy (label_61)
-                _, predicted = outputs["label_61"].max(1)
-                total_correct += predicted.eq(labels["label_61"]).sum().item()
-
-                # Per-task metrics (if criterion returns dict)
-                if isinstance(loss, dict):
-                    for key in task_losses.keys():
-                        task_losses[key] += loss[key].item() * batch_size
+                # Primary task accuracy
+                _, predicted_primary = outputs[primary_task].max(1)
+                total_correct += predicted_primary.eq(labels[primary_task]).sum().item()
 
                 # Per-task accuracy
                 for key in task_correct.keys():
                     _, pred = outputs[key].max(1)
                     task_correct[key] += pred.eq(labels[key]).sum().item()
+
+                # Per-task loss accumulation if dict provided
+                if isinstance(raw_loss, dict):
+                    for k in task_losses_accum.keys():
+                        if k in raw_loss:
+                            task_losses_accum[k] += raw_loss[k].item() * batch_size
             else:
-                # Single task
                 total_loss += loss.item() * batch_size
                 _, predicted = outputs.max(1)
                 total_correct += predicted.eq(labels).sum().item()
@@ -249,11 +260,15 @@ class Trainer:
         metrics = {
             "loss": total_loss / total_samples,
             "accuracy": 100.0 * total_correct / total_samples,
+            "primary_task": primary_task,
         }
 
         if self.multi_task:
             for key in task_correct.keys():
                 metrics[f"acc_{key}"] = 100.0 * task_correct[key] / total_samples
+            if isinstance(raw_loss, dict):
+                for k, v in task_losses_accum.items():
+                    metrics[f"train_loss_{k}"] = v / total_samples
 
         return metrics
 
@@ -262,14 +277,17 @@ class Trainer:
         """
         Validate the model.
 
-        Returns:
-            Dict of validation metrics
+        Supports:
+          - Optional meta in batch
+          - Criterion dict output
+          - Dynamic task weight update (inverse loss EMA)
         """
         self.model.eval()
 
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        primary_task = getattr(self, "primary_task", "label_61")
 
         # Multi-task metrics
         if self.multi_task:
@@ -279,13 +297,23 @@ class Trainer:
                 "disease": 0,
                 "severity": 0,
             }
+            task_losses_accum = {
+                "label_61": 0.0,
+                "crop": 0.0,
+                "disease": 0.0,
+                "severity": 0.0,
+            }
 
-        for images, labels in tqdm(self.val_loader, desc="Validating"):
-            # Move to device - use non_blocking for GPU to overlap transfer
+        for batch in tqdm(self.val_loader, desc="Validating"):
+            # Unpack flexible batch
+            if len(batch) == 3:
+                images, labels, _meta = batch
+            else:
+                images, labels = batch
+
             non_blocking = self.device.type in ["cuda", "mps"]
             images = images.to(self.device, non_blocking=non_blocking)
 
-            # Convert to channels_last for better performance on GPU (CUDA only - MPS has issues)
             if self.device.type == "cuda":
                 images = images.to(memory_format=torch.channels_last)
 
@@ -297,12 +325,19 @@ class Trainer:
                 labels = labels["label_61"].to(self.device, non_blocking=non_blocking)
 
             # Forward pass
-            if self.multi_task:
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+            outputs = self.model(images)
+            raw_loss = self.criterion(outputs, labels)
+
+            if isinstance(raw_loss, dict):
+                loss = raw_loss.get("total", None)
+                if loss is None:
+                    loss = sum(
+                        w * raw_loss[k]
+                        for k, w in getattr(self.criterion, "task_weights", {}).items()
+                        if k in raw_loss
+                    )
             else:
-                outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+                loss = raw_loss
 
             # Metrics
             batch_size = images.size(0)
@@ -311,26 +346,60 @@ class Trainer:
 
             if self.multi_task:
                 # Primary task accuracy
-                _, predicted = outputs["label_61"].max(1)
-                total_correct += predicted.eq(labels["label_61"]).sum().item()
+                _, predicted_primary = outputs[primary_task].max(1)
+                total_correct += predicted_primary.eq(labels[primary_task]).sum().item()
 
-                # Per-task accuracy
                 for key in task_correct.keys():
                     _, pred = outputs[key].max(1)
                     task_correct[key] += pred.eq(labels[key]).sum().item()
+
+                if isinstance(raw_loss, dict):
+                    for k in task_losses_accum.keys():
+                        if k in raw_loss:
+                            task_losses_accum[k] += raw_loss[k].item() * batch_size
             else:
                 _, predicted = outputs.max(1)
                 total_correct += predicted.eq(labels).sum().item()
 
         # Compute metrics
         metrics = {
-            "loss": total_loss / total_samples,
-            "accuracy": 100.0 * total_correct / total_samples,
+            "loss": total_loss / total_samples if total_samples else 0.0,
+            "accuracy": 100.0 * total_correct / total_samples if total_samples else 0.0,
+            "primary_task": primary_task,
         }
 
         if self.multi_task:
             for key in task_correct.keys():
-                metrics[f"acc_{key}"] = 100.0 * task_correct[key] / total_samples
+                metrics[f"acc_{key}"] = (
+                    100.0 * task_correct[key] / total_samples if total_samples else 0.0
+                )
+            if isinstance(raw_loss, dict):
+                for k, v in task_losses_accum.items():
+                    metrics[f"val_loss_{k}"] = v / total_samples if total_samples else 0.0
+
+            # Dynamic task weight update
+            if getattr(self, "dynamic_task_weights", False) and isinstance(raw_loss, dict):
+                eps = 1e-6
+                # Average losses per task
+                avg_losses = {
+                    k: (task_losses_accum[k] / total_samples + eps) for k in task_losses_accum
+                }
+                inv = {k: 1.0 / avg_losses[k] for k in avg_losses}
+                inv_sum = sum(inv.values())
+                if inv_sum > 0:
+                    # Preserve original total scale
+                    current_weights = getattr(self.criterion, "task_weights", {})
+                    scale = sum(current_weights.values()) if current_weights else 1.0
+                    norm_weights = {k: (inv[k] / inv_sum) * scale for k in inv}
+                    alpha = getattr(self, "task_weight_ema", 0.6)
+                    new_weights = {}
+                    for k in norm_weights:
+                        old = current_weights.get(k, norm_weights[k])
+                        new_w = alpha * old + (1 - alpha) * norm_weights[k]
+                        new_weights[k] = new_w
+                    # Apply update
+                    self.criterion.task_weights = new_weights
+                    metrics["dynamic_task_weights"] = new_weights
 
         return metrics
 
