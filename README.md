@@ -119,8 +119,6 @@ ShuWeiCamp/
 
 ## 📖 文档导航
 
-- **[TRAINING_FIX_SUMMARY.md](TRAINING_FIX_SUMMARY.md)** - 🔥 训练问题修复总结 (先看这个!)
-- **[IMPROVEMENTS.md](IMPROVEMENTS.md)** - 详细改进说明和原理
 - **[ROADMAP.md](ROADMAP.md)** - 完整项目路线图
 - **[SETUP.md](SETUP.md)** - 环境配置指南
 
@@ -224,86 +222,11 @@ python train.py --num-workers 8
 python train.py --compile
 ```
 
-## 📊 结果可视化示例
-
-训练后自动生成的图表包含:
-
-1. **Loss Curves** - 训练/验证损失
-2. **Accuracy Curves** - 准确率变化 + 最佳点标注
-3. **LR Schedule** - 学习率变化 (显示warmup阶段)
-4. **Overfitting Analysis** - Train-Val gap分析
-
-状态判断:
-- 🟢 Green: Good fit (gap < 5%)
-- 🟡 Orange: Slight overfitting (5-10%)
-- 🔴 Red: Overfitting (> 10%)
-
-## 🎓 Linus式开发哲学
-
-> **"Talk is cheap. Show me the code."**
-
-我们的原则:
-
-1. ✅ **修复基础问题优先** - LR/warmup/scheduler
-2. ✅ **简单直接的方案** - No fancy tricks
-3. ✅ **可视化验证** - 一图胜千言
-4. ❌ **避免过早优化** - 先让基础work
-
-### 我们做的
-
-- 正确的learning rate
-- Proper warmup schedule
-- 实时可视化监控
-
-### 我们没做 (好品味)
-
-- ~~复杂的optimizer~~
-- ~~花哨的augmentation~~
-- ~~架构搜索~~
-- ~~Ensemble~~
-
-**原因**: 基础训练都没搞对，优化这些没意义。
-
-## 📝 更新日志
-
-### 2024-11-15 - 训练优化
-
-- 🔴 **Critical Fix**: Learning rate 1e-4 → 5e-4
-- 🔴 **Critical Fix**: 添加5 epoch warmup
-- 🔴 **Critical Fix**: 修复scheduler时机
-- ✨ **Feature**: 实时训练可视化
-- ✨ **Feature**: History tracking in checkpoints
-- 📊 **Improvement**: 预期准确率从27.6%提升到70-85%
-
-### 2024-11-14 - 项目初始化
-
-- 数据清洗和预处理
-- 基线模型实现
-- 训练流程搭建
-
-## 🤝 贡献指南
-
-遵循Linus的原则:
-
-1. **代码质量** > 功能数量
-2. **简单方案** > 复杂方案
-3. **实际测试** > 理论分析
-4. **零废话** > 长篇大论
-
 ## 📄 License
 
 MIT License
 
 ## 🙏 致谢
 
-- Linus Torvalds - 为优秀代码品味树立标准
 - PyTorch Team - 优秀的深度学习框架
 - timm - 预训练模型库
-
----
-
-**项目状态**: ✅ 可用  
-**最佳准确率**: 待训练 (预期70-85%)  
-**最后更新**: 2024-11-15
-
-**开始训练**: `bash train_improved.sh` 🚀
