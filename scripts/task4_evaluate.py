@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Project modules
-from models import MultiTaskModel
+from src.models import MultiTaskModel
 from task4train import (
     MultiTaskSeverity3Dataset,
     SeverityCAMWrapper,

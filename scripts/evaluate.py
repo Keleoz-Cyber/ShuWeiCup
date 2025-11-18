@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from models import BaselineModel, MultiTaskModel
+from src.models import BaselineModel, MultiTaskModel
 
 
 def load_model(

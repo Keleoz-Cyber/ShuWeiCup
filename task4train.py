@@ -3,18 +3,7 @@
 """
 Task 4: Multi-Task Joint Learning and Interpretable Diagnosis (REFINED)
 =======================================================================
-
-哥，按你的最新指令：
-- 把严重度从“伪4类”改回真实 3 类：0=Healthy, 1=General, 2=Serious
-- 移除哈希 Mild/Moderate 拆分（比赛题目原描述有误）
-- 增加动态任务权重 (--dynamic-task-weights) ：基于每任务最近一个验证损失的倒数归一，再平滑
-- 报告中输出可读中文 / 英文名称（作物、疾病、严重度）
-- 协同效应对比时真正裁剪模型，只保留严重度 head（避免浪费算力）
-- 诊断报告对应 3 类严重度（新增列 severity_name）
-- 仍支持 Grad-CAM，可视化热区
-- 保留固定权重模式 (--task-weights) 与动态模式互斥（动态模式优先生效）
-
-命令示例：
+Usage Example:
   python task4train.py \
     --train-meta data/cleaned/metadata/train_metadata.csv \
     --val-meta data/cleaned/metadata/val_metadata.csv \
@@ -29,12 +18,10 @@ Task 4: Multi-Task Joint Learning and Interpretable Diagnosis (REFINED)
     --cam-samples 12 \
     --compare-synergy --compare-epochs 8 \
     --out-dir checkpoints/task4_multitask
-
 """
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -53,9 +40,9 @@ from torch.utils.data import DataLoader, Dataset
 
 # Project modules
 # Removed unused get_train_transform, get_val_transform imports
-from losses import MultiTaskLoss
-from models import MultiTaskModel
-from trainer import Trainer
+from src.losses import MultiTaskLoss
+from src.models import MultiTaskModel
+from src.trainer import Trainer
 
 # Grad-CAM (optional)
 try:
@@ -349,7 +336,8 @@ def generate_diagnostic_report(
                     vis = (img_np[:, :, ::-1] * 255).astype(np.uint8)
 
                 vis_name = f"{metas[i]['image_name']}_sev={sev_pred}_conf={sev_conf:.2f}.jpg"
-                cv2.imwrite(str(cam_dir / vis_name), vis)
+                if cam_dir is not None:
+                    cv2.imwrite(str(cam_dir / vis_name), vis)
                 saved_cam += 1
 
             if max_samples is not None and len(rows) >= max_samples:
@@ -635,7 +623,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
-        scheduler=scheduler,
+        scheduler=scheduler,  # type: ignore
         criterion=criterion,
         device=device,
         save_dir=str(out_dir / "multitask"),
@@ -708,7 +696,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             optimizer=optimizer2,
-            scheduler=scheduler2,
+            scheduler=scheduler2,  # type: ignore
             criterion=criterion2,
             device=device,
             save_dir=str(out_dir / "severity_only"),

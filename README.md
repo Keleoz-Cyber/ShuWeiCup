@@ -1,53 +1,88 @@
 # Agricultural Disease Recognition
-============================================================
 
 **"Talk is cheap. Show me the code."** - Linus Torvalds
 
-深度学习农作物病害识别系统 - 61类疾病分类
+深度学习农作物病害识别系统 - 61类疾病分类与多任务学习
+
+## 📁 Project Structure
+
+```
+ShuWeiCamp/
+├── src/                    # 核心模块
+│   ├── __init__.py        # 包初始化
+│   ├── data_structures.py # 标签层次结构
+│   ├── dataset.py         # 数据集实现
+│   ├── models.py          # 模型架构
+│   ├── losses.py          # 损失函数
+│   └── trainer.py         # 训练器
+├── scripts/               # 工具脚本
+│   ├── data_cleaner.py    # 数据清理
+│   ├── evaluate.py        # 模型评估
+│   ├── task4_evaluate.py  # Task4 评估
+│   └── task4_inference_demo.py  # 推理演示
+├── docs/                  # 文档和训练记录
+├── task1train.py          # Task 1: 61类分类训练
+├── task2train.py          # Task 2: 作物类型分类
+├── task3train.py          # Task 3: 病害严重程度分类
+├── task4train.py          # Task 4: 多任务联合训练
+├── config_task1.yaml      # 训练配置
+└── README.md              # 本文件
+```
 
 ## 🚀 Quick Start
 
-### 训练改进版模型 (推荐)
+### 1. 数据准备
 
 ```bash
-# 一键训练 - 使用优化后的超参数
-bash train_improved.sh
+# 清理和预处理数据
+python scripts/data_cleaner.py --src data/raw --dst data/cleaned
 ```
 
-**预期结果**: 70-85% 验证准确率 (vs 基线27.6%)
-
-### 原始训练 (不推荐 - 准确率低)
+### 2. 训练模型
 
 ```bash
-python train.py
+# Task 1: 61类病害分类
+python task1train.py --config config_task1.yaml
+
+# Task 4: 多任务学习 (推荐)
+python task4train.py --epochs 50 --batch-size 64 --backbone efficientnet_b3
 ```
 
-## 📊 实时监控训练
-
-训练过程中自动生成可视化图表:
+### 3. 评估模型
 
 ```bash
-# 查看实时训练曲线
-open checkpoints/task1_improved/training_curves.png
+# 通用评估
+python scripts/evaluate.py --model best.pth --data data/cleaned/val
 
-# 训练后详细分析
-python visualize_training.py --checkpoint-dir checkpoints/task1_improved/
+# Task 4 详细评估
+python scripts/task4_evaluate.py \
+    --checkpoint checkpoints/task4_multitask/best.pth \
+    --val-meta data/cleaned/metadata/val_metadata.csv \
+    --val-dir data/cleaned/val \
+    --out-dir checkpoints/task4_multitask/evaluation
 ```
 
-**图表包含**:
-- Loss curves (train/val)
-- Accuracy curves with best marker
-- Learning rate schedule with warmup
-- Overfitting analysis (train-val gap)
+### 4. 推理演示
 
-## 📈 性能对比
+```bash
+python scripts/task4_inference_demo.py \
+    --checkpoint checkpoints/task4_multitask/best.pth \
+    --val-meta data/cleaned/metadata/val_metadata.csv \
+    --val-dir data/cleaned/val \
+    --out-dir outputs/inference_demo \
+    --num-samples 10
+```
 
-| 配置 | Val Accuracy | 说明 |
-|------|--------------|------|
-| **Baseline** (原始) | 27.6% | ❌ LR太低, 无warmup |
-| **Improved** (优化) | **70-85%** | ✅ 正确的超参数 |
+## 📊 性能对比
 
-### 关键改进
+| 任务 | 模型 | 准确率 | 说明 |
+|------|------|--------|------|
+| Task 1 | ResNet50 | 70-85% | 61类病害分类 |
+| Task 2 | EfficientNet-B3 | 90%+ | 10类作物分类 |
+| Task 3 | ResNet50 | 85%+ | 病害严重程度 (3类) |
+| Task 4 | EfficientNet-B3 (多任务) | 综合最优 | 联合训练所有任务 |
+
+### 关键特性
 
 1. **Learning Rate**: 1e-4 → 5e-4 (5x ↑)
 2. **Batch Size**: 64 → 32 (更好的梯度信号)

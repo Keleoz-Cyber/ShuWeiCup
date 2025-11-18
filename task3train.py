@@ -2,56 +2,7 @@
 """
 Task 3: Disease Severity Grading (4-class)
 ==========================================
-
-哥，任务3需要把原始的 (Healthy / General / Serious) 结构扩展为 4 个等级：
-    0: Healthy
-    1: Mild
-    2: Moderate
-    3: Severe
-
-数据集中本质只有 3 个显式等级 (0,1,2)。我们不能凭空发明不存在的真实标签，但可以用一种
-确定性、无分支混乱、可复现的映射，把原始 General 拆成 Mild / Moderate 两类，从而训练一个
-4 分类模型，满足题目要求，并保持不破坏用户空间(原始标签仍可重建)。
-
-核心策略（实用主义 + 消除特殊情况）:
-1. Healthy -> 0 (Healthy)
-2. Serious -> 3 (Severe)
-3. General -> 拆分为 Mild(1) / Moderate(2)
-   拆分方法：对 image_name 做稳定哈希（md5），根据最低一位奇偶决定归类。
-   - 偶数 -> Mild
-   - 奇数 -> Moderate
-   这样：
-     - 不引入人工主观判断
-     - 保证类间样本数近似 50/50
-     - 映射可逆：只要 Mild 或 Moderate 都能回到 General
-
-优点：
-- 完全确定性：不同机器 / 不同时间运行结果一致
-- 不增加人工噪声标注文件
-- 不需要手工维护名单，无特殊分支
-- 没有破坏原始 metadata，可并行保留原标签
-
-数据结构：
-- 使用现有 metadata CSV (data/cleaned/metadata/train_metadata.csv, val_metadata.csv)
-- 新增列 severity_4class, 通过函数 deterministic_general_split(row['image_name'], row['severity'])
-
-模型：
-- 单任务 4 分类 (ResNet50 backbone via timm)。参数远 < 50M。
-- 支持 可选 class weight (sqrt 平滑 / inverse freq)。
-- 训练与验证循环简洁，<3层缩进。
-
-评估：
-- Accuracy
-- Macro-F1
-- Per-class Recall
-- 混淆矩阵
-- Grad-CAM 可视化 (grad-cam 包) → 输出 top-N 样本热力图 (正确 + 错误)
-
-兼容性：
-- 不破坏现有 MultiTask / Dataset 类：这里实现独立 SeverityDataset，最大化简洁。
-- 可以轻松替换为 MultiTaskModel(severity head) 进行联合训练（留接口）。
-
-用法示例：
+Usage Example:
     python task3train.py \
         --train-meta data/cleaned/metadata/train_metadata.csv \
         --val-meta data/cleaned/metadata/val_metadata.csv \
@@ -63,11 +14,6 @@ Task 3: Disease Severity Grading (4-class)
         --lr 3e-4 \
         --use-class-weights \
         --gradcam-samples 12
-
-可视化：
-    输出: out_dir/gradcam/ 类似:
-        sample_XXX_true=2_pred=1_correct.png
-
 """
 
 import argparse
@@ -449,15 +395,15 @@ def calibrate_temperature(
     labels: [N]
     """
     device = logits.device
-    T = torch.nn.Parameter(torch.ones(1, device=device) * init_temp)
-    optimizer = torch.optim.Adam([T], lr=lr)
+    temp = torch.nn.Parameter(torch.ones(1, device=device) * init_temp)
+    optimizer = torch.optim.Adam([temp], lr=lr)
     for _ in range(max_iter):
         optimizer.zero_grad()
-        scaled = logits / T
+        scaled = logits / temp
         loss = F.cross_entropy(scaled, labels)
         loss.backward()
         optimizer.step()
-    return T.detach().item()
+    return temp.detach().item()
 
 
 def build_class_weights(
@@ -570,7 +516,7 @@ def validate(
     for images, labels, names in tqdm(loader, desc="Val", ncols=100):
         images = images.to(device)
         labels = labels.to(device)
-        logits = model(images)
+        logits = model(images)  # type: ignore
         loss = criterion(logits, labels)
 
         batch_size = images.size(0)
@@ -606,7 +552,10 @@ def validate(
 
             # Targets: derive deterministic 4-class from (0/1/2) + image_name (hash split for General)
             labels_cpu = labels.cpu().tolist()
-            targets_4 = [map_severity_to_4class(int(l), names[i]) for i, l in enumerate(labels_cpu)]
+            targets_4 = [
+                map_severity_to_4class(int(label_val), names[i])
+                for i, label_val in enumerate(labels_cpu)
+            ]
 
         all_targets_4.extend(targets_4)
         all_preds_4.extend(preds_4)
@@ -716,7 +665,7 @@ def plot_training_curves(history: Dict[str, List[float]], save_path: Path):
     ax3.set_yscale("log")
     ax3.grid(True, alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+    plt.tight_layout(rect=(0, 0.03, 1, 0.96))
     plt.savefig(save_path, dpi=120, bbox_inches="tight")
     plt.close()
     print(f"Saved training curves: {save_path}")

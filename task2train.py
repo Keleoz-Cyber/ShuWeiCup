@@ -3,23 +3,6 @@
 """
 Task 2 Few-Shot Training (ArcFace + Prototype EMA)
 ==================================================
-
-Clean, robust, few-shot oriented trainer with:
-- CUDA/MPS-safe AMP (AMP only on CUDA; MPS/CPU use FP32)
-- Picklable collate function (no lambdas)
-- EMA prototypes with configurable refresh interval
-- Delayed, selective unfreeze of backbone layer4 (Strategy F)
-- Defaults implementing strategies A–F:
-  A. head-lr-scale = 3.0
-  B. dropout = 0.3
-  C. mixup-disable-epoch = 8
-  D. label-smoothing = 0.05
-  E. proto-weight = 0.4
-  F. delayed unfreeze of layer4 at epoch 3; layer3 remains frozen
-- Stable Albumentations transforms (Resize + Flip + mild ColorJitter + Normalize)
-- Adaptive DataLoader workers (2 on CUDA; 0 on MPS/CPU) and pin_memory only on CUDA
-- Full logging, TensorBoard, PNG curves, confusion matrix CSV/PNG, and history CSV
-
 Usage Example:
   python task2train.py \
     --train-meta data/cleaned/metadata/train_metadata_fewshot_10.csv \
@@ -72,7 +55,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 # Project dataset
-from dataset import AgriDiseaseDataset
+from src.dataset import AgriDiseaseDataset
 
 
 # =========================
@@ -184,8 +167,8 @@ def compute_prototypes(
         labels = label_dict["label_61"].to(device)
         images = images.to(device)
         feats = model.extract_features(images)
-        for f, l in zip(feats, labels):
-            li = int(l.item())
+        for f, label_item in zip(feats, labels):
+            li = int(label_item.item())  # type: ignore[union-attr]
             if li not in sums:
                 sums[li] = f.clone()
                 counts[li] = 1

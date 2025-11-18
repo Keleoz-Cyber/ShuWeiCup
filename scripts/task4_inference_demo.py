@@ -33,7 +33,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
-from models import MultiTaskModel
+from src.models import MultiTaskModel
 from task4train import MultiTaskSeverity3Dataset, SeverityCAMWrapper
 
 # Try to import Grad-CAM

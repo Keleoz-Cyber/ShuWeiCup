@@ -27,7 +27,7 @@ import pandas as pd
 from tqdm import tqdm
 
 # Import our data structures
-from data_structures import (
+from src.data_structures import (
     LABEL_61_TO_NAME,
     LABEL_HIERARCHY,
     get_multitask_labels,

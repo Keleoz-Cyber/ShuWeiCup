@@ -1,15 +1,27 @@
 """
 Agricultural Disease Recognition - Main Training Script
 ========================================================
-
-"Talk is cheap. Show me the code." - Linus Torvalds
-
-This is the main training script for Task 1: 61-class disease classification.
-Keep it simple. Make it work. Then optimize.
-
-Usage:
-    python train.py --config config_task1.yaml
-    python train.py --backbone resnet50 --epochs 50 --batch-size 64
+Usage Example:
+    python task1train.py \
+      --model-type baseline \
+      --backbone resnet50 \
+      --epochs 50 \
+      --batch-size 32 \
+      --lr 5e-4 \
+      --use-ema \
+      --mixup-alpha 0.4 --cutmix-alpha 0.6 \
+      --mixup-decay-epoch1 8 \
+      --mixup-decay-epoch2 10 \
+      --mixup-disable-epoch 12 \
+      --cutmix-disable-epoch 8 \
+      --smoothing-decay-epoch1 10 \
+      --smoothing-decay-epoch2 12 \
+      --tail-focal-epoch 14 \
+      --progressive-resize-epoch 18 \
+      --progressive-image-size 256 \
+      --final-clean-epoch 28 \
+      --lr-restart-epoch 20 \
+      --save-dir checkpoints/task1_accel
 """
 
 import argparse
@@ -30,10 +42,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 # Import our modules
-from dataset import AgriDiseaseDataset, collate_fn, get_train_transform, get_val_transform
-from losses import FocalLoss, create_loss_function
-from models import create_model
-from trainer import Trainer
+from src.dataset import AgriDiseaseDataset, collate_fn, get_train_transform, get_val_transform
+from src.losses import FocalLoss, create_loss_function
+from src.models import create_model
+from src.trainer import Trainer
 
 
 # Cosine / Center loss moved to module scope (clean activation flags)
@@ -326,13 +338,13 @@ def custom_train_loop(
                 pg["lr"] = pg["lr"] * 0.4
             print(f"[Phase] LR restart @ epoch {epoch}")
         if epoch == progressive_resize_epoch:
-            from dataset import get_train_transform
+            from src.dataset import get_train_transform
 
             new_transform = get_train_transform(progressive_image_size)
             train_loader.dataset.transform = new_transform
             print(f"[Phase] Progressive resize -> {progressive_image_size} @ epoch {epoch}")
         if epoch == final_clean_epoch:
-            from dataset import get_light_train_transform
+            from src.dataset import get_light_train_transform
 
             train_loader.dataset.transform = get_light_train_transform(progressive_image_size)
             print(f"[Phase] Final clean augmentation @ epoch {epoch}")
@@ -427,7 +439,7 @@ def custom_train_loop(
                     dummy = torch.zeros(
                         1, 3, progressive_image_size, progressive_image_size, device=device
                     )
-                    feat_dim = model.get_features(dummy).shape[1]
+                    feat_dim = model.get_features(dummy).shape[1]  # type: ignore
                 model.cosine_head = CosineClassifier(feat_dim, 61).to(device)
                 # Flag removed to avoid assigning non-Tensor/Module attribute; use presence of cosine_head instead
                 print(f"[Phase] Cosine classifier activated @ epoch {epoch} (feat_dim={feat_dim})")
@@ -437,7 +449,7 @@ def custom_train_loop(
                     dummy = torch.zeros(
                         1, 3, progressive_image_size, progressive_image_size, device=device
                     )
-                    feat_dim = model.get_features(dummy).shape[1]
+                    feat_dim = model.get_features(dummy).shape[1]  # type: ignore
                 model.center_loss_mod = CenterLoss(61, feat_dim).to(device)
                 # Flag removed; presence of center_loss_mod implies activation
                 print(f"[Phase] CenterLoss activated @ epoch {epoch} (weight={center_loss_weight})")
@@ -477,7 +489,7 @@ def custom_train_loop(
 
                     cm_df = pd.DataFrame(cm.numpy())
                     cm_df.to_csv(save_path / "confusion_matrix_best.csv", index=False)
-                    print(f"  [CM] Saved confusion matrix CSV")
+                    print("  [CM] Saved confusion matrix CSV")
                 except Exception as e:
                     print(f"  [Warn] Failed to save CM CSV: {e}")
 
@@ -491,7 +503,7 @@ def custom_train_loop(
                 plt.tight_layout()
                 fig_cm.savefig(save_path / "confusion_matrix_best.png", dpi=120)
                 plt.close(fig_cm)
-                print(f"  [CM] Saved confusion matrix PNG")
+                print("  [CM] Saved confusion matrix PNG")
 
             torch.save(
                 {
@@ -1036,7 +1048,7 @@ def main():
     print("\n" + "=" * 60)
     print("Agricultural Disease Recognition - Training")
     print("=" * 60)
-    print(f"Task: Task 1 - 61-class classification")
+    print("Task: Task 1 - 61-class classification")
     print(f"Model: {args.backbone} ({args.model_type})")
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size}")
@@ -1173,7 +1185,7 @@ def main():
     print("\nCreating optimizer...")
     # Save initial label smoothing to allow mid-training reduction
     initial_label_smoothing = args.label_smoothing
-    reduced_label_smoothing = 0.02 if initial_label_smoothing > 0.02 else initial_label_smoothing
+
     if args.model_type == "fewshot":
         # Scale LR for few-shot classifier head with safe getattr fallback
         base_lr = args.lr
@@ -1259,7 +1271,7 @@ def main():
             step_size=20,
             gamma=0.1,
         )
-        print(f"Scheduler: Step LR")
+        print("Scheduler: Step LR")
 
     # Create trainer
     print("\nInitializing trainer...")
